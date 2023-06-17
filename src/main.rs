@@ -12,6 +12,7 @@ const WALL_STIFNESS: f32 = 3000.0;
 const GRAVITY_ACCELERATION: f32 = 9.8;
 const RANGE_X: f32 = 1.0;
 const RANGE_Y: f32 = 1.0;
+const PI: f32 = std::f32::consts::PI;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct Particle {
@@ -20,6 +21,30 @@ struct Particle {
     density: f32,
     pressure: f32,
     force: Vec2,
+}
+
+fn poly6(r: Vec2, h: f32) -> f32 {
+    if r.length() < h {
+        4.0 / (PI * h.powi(8)) * (h.powi(2) - r.length_squared()).powi(3)
+    } else {
+        0.0
+    }
+}
+
+fn lap_viscocity(r: Vec2, h: f32) -> f32 {
+    if r.length() < h {
+        20.0 / (3.0 * PI * h.powi(5)) * (h - r.length())
+    } else {
+        0.0
+    }
+}
+
+fn grad_spiky(r: Vec2, h: f32) -> Vec2 {
+    if r.length() < h {
+        -30.0 / (PI * h.powi(5)) * (h - r.length()).powi(2) * r.normalize()
+    } else {
+        Vec2::ZERO
+    }
 }
 
 fn compute_density(read_buffer: &[Particle], write_buffer: &mut [Particle]) {
@@ -31,14 +56,11 @@ fn compute_density(read_buffer: &[Particle], write_buffer: &mut [Particle]) {
                 continue;
             }
 
-            let distance = read_buffer[i].position.distance(read_buffer[j].position);
-
             write_buffer[i].density += PARTICLE_MASS
-                * if distance <= PARTICLE_RADIUS {
-                    (PARTICLE_RADIUS.powi(2) - distance.powi(2)).powi(3)
-                } else {
-                    0.0
-                };
+                * poly6(
+                    read_buffer[j].position - read_buffer[i].position,
+                    PARTICLE_RADIUS,
+                );
         }
     }
 }
@@ -59,32 +81,24 @@ fn compute_force(read_buffer: &[Particle], write_buffer: &mut [Particle]) {
                 continue;
             }
 
-            let distance = read_buffer[i].position.distance(read_buffer[j].position);
-
             // viscosity force
             write_buffer[i].force +=
                 VISCOSITY * PARTICLE_MASS * (read_buffer[j].velocity - read_buffer[i].velocity)
                     / read_buffer[j].density
-                    * if distance <= PARTICLE_RADIUS {
-                        20.0 / (3.0 * std::f32::consts::PI * PARTICLE_RADIUS.powi(5))
-                            * (PARTICLE_RADIUS - distance)
-                    } else {
-                        0.0
-                    };
+                    * lap_viscocity(
+                        read_buffer[j].position - read_buffer[i].position,
+                        PARTICLE_RADIUS,
+                    );
 
             // pressure force
             write_buffer[i].force += -1.0 / read_buffer[i].density
                 * PARTICLE_MASS
                 * (read_buffer[j].pressure - read_buffer[i].pressure)
                 / (2.0 * read_buffer[j].density)
-                * if distance <= PARTICLE_RADIUS {
-                    -30.0 / (std::f32::consts::PI * PARTICLE_RADIUS.powi(5))
-                        * (PARTICLE_RADIUS - distance).powi(2)
-                        * (read_buffer[j].position - read_buffer[i].position)
-                        / distance
-                } else {
-                    Vec2::ZERO
-                };
+                * grad_spiky(
+                    read_buffer[j].position - read_buffer[i].position,
+                    PARTICLE_RADIUS,
+                );
         }
     }
 }
