@@ -9,7 +9,9 @@ const PRESSURE_STIFFNESS: f32 = 200.0;
 const REST_DENSITY: f32 = 1000.0;
 const TIME_STEP: f32 = 0.01666;
 const WALL_STIFNESS: f32 = 3000.0;
-const GRAVITY_ACCELERATION: f32 = 9.81;
+const GRAVITY_ACCELERATION: f32 = 9.8;
+const RANGE_X: f32 = 1.0;
+const RANGE_Y: f32 = 1.0;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct Particle {
@@ -93,13 +95,13 @@ fn compute_position_and_velocity(read_buffer: &[Particle], write_buffer: &mut [P
 
         let mut penalty_acceleration = Vec2::ZERO;
         penalty_acceleration +=
-            read_buffer[i].position.dot(Vec2::X).min(0.0) * WALL_STIFNESS * Vec2::NEG_X;
+            read_buffer[i].position.dot(Vec2::NEG_X).max(0.0) * WALL_STIFNESS * Vec2::X;
         penalty_acceleration +=
-            read_buffer[i].position.dot(Vec2::NEG_X).min(0.0) * WALL_STIFNESS * Vec2::X;
+            (read_buffer[i].position.dot(Vec2::X) - RANGE_X).max(0.0) * WALL_STIFNESS * Vec2::NEG_X;
         penalty_acceleration +=
-            read_buffer[i].position.dot(Vec2::Y).min(0.0) * WALL_STIFNESS * Vec2::NEG_Y;
+            read_buffer[i].position.dot(Vec2::NEG_Y).max(0.0) * WALL_STIFNESS * Vec2::Y;
         penalty_acceleration +=
-            read_buffer[i].position.dot(Vec2::NEG_Y).min(0.0) * WALL_STIFNESS * Vec2::Y;
+            (read_buffer[i].position.dot(Vec2::Y) - RANGE_Y).max(0.0) * WALL_STIFNESS * Vec2::NEG_Y;
 
         let mut acceleration = read_buffer[i].force / read_buffer[i].density;
         if acceleration.is_nan() {
@@ -122,8 +124,8 @@ fn render_to_cui(read_buffer: &[Particle]) {
     for i in 0..PARTICLE_SIZE {
         let position = read_buffer[i].position;
 
-        let x = (position.x * 5.0 + 5.0).floor() as i32;
-        let y = (position.y * 5.0 + 5.0).floor() as i32;
+        let x = (position.x / RANGE_X * 10.0).floor() as i32;
+        let y = (position.y / RANGE_Y * 10.0).floor() as i32;
         if 0 <= x && x < 10 && 0 <= y && y < 10 {
             amount_map[y as usize][x as usize] += 1;
         }
@@ -161,7 +163,8 @@ fn main() {
 
     let mut init_buffer = [Particle::default(); PARTICLE_SIZE];
     for i in 0..PARTICLE_SIZE {
-        init_buffer[i].position = Vec2::new(rng.gen_range(-1.0..=1.0), rng.gen_range(-1.0..=1.0));
+        init_buffer[i].position =
+            Vec2::new(rng.gen_range(0.0..=RANGE_X), rng.gen_range(0.0..=RANGE_Y));
     }
 
     let mut read_buffer = init_buffer.clone();
