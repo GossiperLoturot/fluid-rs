@@ -1,4 +1,5 @@
 use glam::*;
+use rand::Rng;
 
 const PARTICLE_SIZE: usize = 1024;
 const PARTICLE_RADIUS: f32 = 0.012;
@@ -7,8 +8,10 @@ const VISCOSITY: f32 = 0.1;
 const PRESSURE_STIFFNESS: f32 = 200.0;
 const REST_DENSITY: f32 = 1000.0;
 const TIME_STEP: f32 = 0.01666;
+const WALL_STIFNESS: f32 = 3000.0;
+const GRAVITY_ACCELERATION: f32 = 9.81;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 struct Particle {
     position: Vec2,
     velocity: Vec2,
@@ -86,7 +89,24 @@ fn compute_force(read_buffer: &[Particle], write_buffer: &mut [Particle]) {
 
 fn compute_position_and_velocity(read_buffer: &[Particle], write_buffer: &mut [Particle]) {
     for i in 0..PARTICLE_SIZE {
-        let acceleration = read_buffer[i].force / read_buffer[i].density;
+        let external_acceleration = Vec2::NEG_Y * GRAVITY_ACCELERATION;
+
+        let mut penalty_acceleration = Vec2::ZERO;
+        penalty_acceleration +=
+            read_buffer[i].position.dot(Vec2::X).min(0.0) * WALL_STIFNESS * Vec2::NEG_X;
+        penalty_acceleration +=
+            read_buffer[i].position.dot(Vec2::NEG_X).min(0.0) * WALL_STIFNESS * Vec2::X;
+        penalty_acceleration +=
+            read_buffer[i].position.dot(Vec2::Y).min(0.0) * WALL_STIFNESS * Vec2::NEG_Y;
+        penalty_acceleration +=
+            read_buffer[i].position.dot(Vec2::NEG_Y).min(0.0) * WALL_STIFNESS * Vec2::Y;
+
+        let mut acceleration = read_buffer[i].force / read_buffer[i].density;
+        if acceleration.is_nan() {
+            acceleration = Vec2::ZERO;
+        }
+
+        let acceleration = acceleration + external_acceleration + penalty_acceleration;
         let velocity = read_buffer[i].velocity + acceleration * TIME_STEP;
         let position = read_buffer[i].position + velocity * TIME_STEP;
 
@@ -95,15 +115,72 @@ fn compute_position_and_velocity(read_buffer: &[Particle], write_buffer: &mut [P
     }
 }
 
+fn render_to_cui(read_buffer: &[Particle]) {
+    let mut text = String::new();
+    let mut amount_map = [[0; 10]; 10];
+
+    for i in 0..PARTICLE_SIZE {
+        let position = read_buffer[i].position;
+
+        let x = (position.x * 5.0 + 5.0).floor() as i32;
+        let y = (position.y * 5.0 + 5.0).floor() as i32;
+        if 0 <= x && x < 10 && 0 <= y && y < 10 {
+            amount_map[y as usize][x as usize] += 1;
+        }
+    }
+
+    for i in 0..10 {
+        for j in 0..10 {
+            let amount = amount_map[i][j];
+            text.push(if amount == 0 {
+                ' '
+            } else if amount < 16 {
+                '.'
+            } else if amount < 32 {
+                '-'
+            } else if amount < 64 {
+                '='
+            } else if amount < 128 {
+                '*'
+            } else if amount < 256 {
+                '%'
+            } else if amount < 512 {
+                '$'
+            } else {
+                '#'
+            });
+        }
+        text.push('\n');
+    }
+
+    print!("\x1b[2J\x1b[1;1H{}", text);
+}
+
 fn main() {
-    let read_buffer = vec![Particle::default(); PARTICLE_SIZE];
-    let mut write_buffer = vec![Particle::default(); PARTICLE_SIZE];
+    let mut rng = rand::thread_rng();
+
+    let mut init_buffer = [Particle::default(); PARTICLE_SIZE];
+    for i in 0..PARTICLE_SIZE {
+        init_buffer[i].position = Vec2::new(rng.gen_range(-1.0..=1.0), rng.gen_range(-1.0..=1.0));
+    }
+
+    let mut read_buffer = init_buffer.clone();
+    let mut write_buffer = init_buffer;
 
     loop {
         compute_density(&read_buffer, &mut write_buffer);
+        read_buffer.copy_from_slice(&write_buffer);
+
         compute_pressure(&read_buffer, &mut write_buffer);
+        read_buffer.copy_from_slice(&write_buffer);
+
         compute_force(&read_buffer, &mut write_buffer);
+        read_buffer.copy_from_slice(&write_buffer);
+
         compute_position_and_velocity(&read_buffer, &mut write_buffer);
+        read_buffer.copy_from_slice(&write_buffer);
+
+        render_to_cui(&read_buffer);
 
         std::thread::sleep(std::time::Duration::from_secs_f32(TIME_STEP));
     }
