@@ -47,34 +47,34 @@ fn grad_spiky(r: Vec2, h: f32) -> Vec2 {
     }
 }
 
-fn compute_density(read_buffer: &[Particle], write_buffer: &mut [Particle]) {
+fn compute_density(particles: &mut [Particle]) {
     for i in 0..PARTICLE_SIZE {
-        write_buffer[i].density = 0.0;
+        particles[i].density = 0.0;
 
         for j in 0..PARTICLE_SIZE {
             if i == j {
                 continue;
             }
 
-            write_buffer[i].density += PARTICLE_MASS
+            particles[i].density += PARTICLE_MASS
                 * poly6(
-                    read_buffer[j].position - read_buffer[i].position,
+                    particles[j].position - particles[i].position,
                     PARTICLE_RADIUS,
                 );
         }
     }
 }
 
-fn compute_pressure(read_buffer: &[Particle], write_buffer: &mut [Particle]) {
+fn compute_pressure(particles: &mut [Particle]) {
     for i in 0..PARTICLE_SIZE {
-        write_buffer[i].pressure =
-            PRESSURE_STIFFNESS * ((read_buffer[i].density / REST_DENSITY).powi(7) - 1.0).max(0.0);
+        particles[i].pressure =
+            PRESSURE_STIFFNESS * ((particles[i].density / REST_DENSITY).powi(7) - 1.0).max(0.0);
     }
 }
 
-fn compute_force(read_buffer: &[Particle], write_buffer: &mut [Particle]) {
+fn compute_force(particles: &mut [Particle]) {
     for i in 0..PARTICLE_SIZE {
-        write_buffer[i].force = Vec2::ZERO;
+        particles[i].force = Vec2::ZERO;
 
         for j in 0..PARTICLE_SIZE {
             if i == j {
@@ -82,61 +82,61 @@ fn compute_force(read_buffer: &[Particle], write_buffer: &mut [Particle]) {
             }
 
             // viscosity force
-            write_buffer[i].force +=
-                VISCOSITY * PARTICLE_MASS * (read_buffer[j].velocity - read_buffer[i].velocity)
-                    / read_buffer[j].density
+            particles[i].force +=
+                VISCOSITY * PARTICLE_MASS * (particles[j].velocity - particles[i].velocity)
+                    / particles[j].density
                     * lap_viscocity(
-                        read_buffer[j].position - read_buffer[i].position,
+                        particles[j].position - particles[i].position,
                         PARTICLE_RADIUS,
                     );
 
             // pressure force
-            write_buffer[i].force += -1.0 / read_buffer[i].density
+            particles[i].force += -1.0 / particles[i].density
                 * PARTICLE_MASS
-                * (read_buffer[j].pressure - read_buffer[i].pressure)
-                / (2.0 * read_buffer[j].density)
+                * (particles[j].pressure - particles[i].pressure)
+                / (2.0 * particles[j].density)
                 * grad_spiky(
-                    read_buffer[j].position - read_buffer[i].position,
+                    particles[j].position - particles[i].position,
                     PARTICLE_RADIUS,
                 );
         }
     }
 }
 
-fn compute_position_and_velocity(read_buffer: &[Particle], write_buffer: &mut [Particle]) {
+fn compute_position_and_velocity(particles: &mut [Particle]) {
     for i in 0..PARTICLE_SIZE {
         let external_acceleration = Vec2::NEG_Y * GRAVITY_ACCELERATION;
 
         let mut penalty_acceleration = Vec2::ZERO;
         penalty_acceleration +=
-            read_buffer[i].position.dot(Vec2::NEG_X).max(0.0) * WALL_STIFNESS * Vec2::X;
+            particles[i].position.dot(Vec2::NEG_X).max(0.0) * WALL_STIFNESS * Vec2::X;
         penalty_acceleration +=
-            (read_buffer[i].position.dot(Vec2::X) - RANGE_X).max(0.0) * WALL_STIFNESS * Vec2::NEG_X;
+            (particles[i].position.dot(Vec2::X) - RANGE_X).max(0.0) * WALL_STIFNESS * Vec2::NEG_X;
         penalty_acceleration +=
-            read_buffer[i].position.dot(Vec2::NEG_Y).max(0.0) * WALL_STIFNESS * Vec2::Y;
+            particles[i].position.dot(Vec2::NEG_Y).max(0.0) * WALL_STIFNESS * Vec2::Y;
         penalty_acceleration +=
-            (read_buffer[i].position.dot(Vec2::Y) - RANGE_Y).max(0.0) * WALL_STIFNESS * Vec2::NEG_Y;
+            (particles[i].position.dot(Vec2::Y) - RANGE_Y).max(0.0) * WALL_STIFNESS * Vec2::NEG_Y;
 
-        let mut acceleration = read_buffer[i].force / read_buffer[i].density;
+        let mut acceleration = particles[i].force / particles[i].density;
         if acceleration.is_nan() {
             acceleration = Vec2::ZERO;
         }
 
         let acceleration = acceleration + external_acceleration + penalty_acceleration;
-        let velocity = read_buffer[i].velocity + acceleration * TIME_STEP;
-        let position = read_buffer[i].position + velocity * TIME_STEP;
+        let velocity = particles[i].velocity + acceleration * TIME_STEP;
+        let position = particles[i].position + velocity * TIME_STEP;
 
-        write_buffer[i].velocity = velocity;
-        write_buffer[i].position = position;
+        particles[i].velocity = velocity;
+        particles[i].position = position;
     }
 }
 
-fn render_to_cui(read_buffer: &[Particle]) {
+fn render_to_cui(particles: &[Particle]) {
     let mut text = String::new();
     let mut amount_map = [[0; 10]; 10];
 
     for i in 0..PARTICLE_SIZE {
-        let position = read_buffer[i].position;
+        let position = particles[i].position;
 
         let x = (position.x / RANGE_X * 10.0).floor() as i32;
         let y = (position.y / RANGE_Y * 10.0).floor() as i32;
@@ -175,29 +175,19 @@ fn render_to_cui(read_buffer: &[Particle]) {
 fn main() {
     let mut rng = rand::thread_rng();
 
-    let mut init_buffer = [Particle::default(); PARTICLE_SIZE];
+    let mut particles = [Particle::default(); PARTICLE_SIZE];
     for i in 0..PARTICLE_SIZE {
-        init_buffer[i].position =
+        particles[i].position =
             Vec2::new(rng.gen_range(0.0..=RANGE_X), rng.gen_range(0.0..=RANGE_Y));
     }
 
-    let mut read_buffer = init_buffer.clone();
-    let mut write_buffer = init_buffer;
-
     loop {
-        compute_density(&read_buffer, &mut write_buffer);
-        read_buffer.copy_from_slice(&write_buffer);
+        compute_density(&mut particles);
+        compute_pressure(&mut particles);
+        compute_force(&mut particles);
+        compute_position_and_velocity(&mut particles);
 
-        compute_pressure(&read_buffer, &mut write_buffer);
-        read_buffer.copy_from_slice(&write_buffer);
-
-        compute_force(&read_buffer, &mut write_buffer);
-        read_buffer.copy_from_slice(&write_buffer);
-
-        compute_position_and_velocity(&read_buffer, &mut write_buffer);
-        read_buffer.copy_from_slice(&write_buffer);
-
-        render_to_cui(&read_buffer);
+        render_to_cui(&particles);
 
         std::thread::sleep(std::time::Duration::from_secs_f32(TIME_STEP));
     }
