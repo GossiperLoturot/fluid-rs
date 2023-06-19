@@ -2,11 +2,11 @@ use glam::*;
 use rand::Rng;
 
 // simulation params
-const ITERATE: usize = 256;
-const TIME_STEP: f32 = 0.0001;
-const PARTICLE_SIZE: usize = 256;
-const PARTICLE_RADIUS: f32 = 0.1;
-const PARTICLE_MASS: f32 = 1.0;
+const ITERATE: usize = 64;
+const TIME_STEP: f32 = 0.001;
+const PARTICLE_SIZE: usize = 512;
+const PARTICLE_RADIUS: f32 = 0.2;
+const PARTICLE_MASS: f32 = 2.0;
 
 // viscosity params
 const VISCOSITY: f32 = 0.15;
@@ -19,6 +19,7 @@ const REST_DENSITY: f32 = 500.0;
 const VELOCITY_DUMPING: f32 = -0.5;
 const RANGE_X: f32 = 1.0;
 const RANGE_Y: f32 = 1.0;
+const RANGE_Z: f32 = 1.0;
 
 // renderer params
 const STDOUT_X: usize = 32;
@@ -30,34 +31,34 @@ const GRAVITY_ACCELERATION: f32 = 9.8;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct Particle {
-    position: Vec2,
-    velocity: Vec2,
-    acceleration: Vec2,
+    position: Vec3,
+    velocity: Vec3,
+    acceleration: Vec3,
     density: f32,
     pressure: f32,
 }
 
 // kernel functions
 
-fn poly6(r: Vec2, h: f32) -> f32 {
+fn poly6(r: Vec3, h: f32) -> f32 {
     if r.length() < h {
-        4.0 / (PI * h.powi(8)) * (h.powi(2) - r.length_squared()).powi(3)
+        315.0 / (64.0 * PI * h.powi(9)) * (h.powi(2) - r.length_squared()).powi(3)
     } else {
         0.0
     }
 }
 
-fn grad_spiky(r: Vec2, h: f32) -> Vec2 {
+fn grad_spiky(r: Vec3, h: f32) -> Vec3 {
     if r.length() < h {
-        -30.0 / (PI * h.powi(5)) * (h - r.length()).powi(2) * r.normalize()
+        -45.0 / (PI * h.powi(6)) * (h - r.length()).powi(2) * r.normalize()
     } else {
-        Vec2::ZERO
+        Vec3::ZERO
     }
 }
 
-fn lap_viscocity(r: Vec2, h: f32) -> f32 {
+fn lap_viscocity(r: Vec3, h: f32) -> f32 {
     if r.length() < h {
-        20.0 / (3.0 * PI * h.powi(5)) * (h - r.length())
+        45.0 / (PI * h.powi(6)) * (h - r.length())
     } else {
         0.0
     }
@@ -91,7 +92,7 @@ fn compute_density_and_pressure(particles: &mut [Particle]) {
 
 fn compute_acceleration(particles: &mut [Particle]) {
     for i in 0..PARTICLE_SIZE {
-        particles[i].acceleration = Vec2::ZERO;
+        particles[i].acceleration = Vec3::ZERO;
 
         for j in 0..PARTICLE_SIZE {
             if i == j {
@@ -124,7 +125,7 @@ fn compute_acceleration(particles: &mut [Particle]) {
         }
 
         // gravity
-        particles[i].acceleration += Vec2::NEG_Y * GRAVITY_ACCELERATION;
+        particles[i].acceleration += Vec3::NEG_Y * GRAVITY_ACCELERATION;
     }
 }
 
@@ -148,6 +149,13 @@ fn compute_position_and_velocity(particles: &mut [Particle]) {
         } else if RANGE_Y < particles[i].position.y {
             particles[i].position.y = RANGE_Y;
             particles[i].velocity.y *= VELOCITY_DUMPING;
+        }
+        if particles[i].position.z < 0.0 {
+            particles[i].position.z = 0.0;
+            particles[i].velocity.z *= VELOCITY_DUMPING;
+        } else if RANGE_Z < particles[i].position.z {
+            particles[i].position.z = RANGE_Z;
+            particles[i].velocity.z *= VELOCITY_DUMPING;
         }
     }
 }
@@ -193,8 +201,11 @@ fn main() {
     // spawn particle
     let mut particles = [Particle::default(); PARTICLE_SIZE];
     for i in 0..PARTICLE_SIZE {
-        particles[i].position =
-            Vec2::new(rng.gen_range(0.0..=RANGE_X), rng.gen_range(0.0..=RANGE_Y));
+        particles[i].position = Vec3::new(
+            rng.gen_range(0.0..=RANGE_X),
+            rng.gen_range(0.0..=RANGE_Y),
+            rng.gen_range(0.0..=RANGE_Z),
+        );
     }
 
     loop {
