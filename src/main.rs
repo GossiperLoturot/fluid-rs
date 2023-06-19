@@ -47,19 +47,19 @@ fn poly6(r: Vec2, h: f32) -> f32 {
     }
 }
 
-fn lap_viscocity(r: Vec2, h: f32) -> f32 {
-    if r.length() < h {
-        20.0 / (3.0 * PI * h.powi(5)) * (h - r.length())
-    } else {
-        0.0
-    }
-}
-
 fn grad_spiky(r: Vec2, h: f32) -> Vec2 {
     if r.length() < h {
         -30.0 / (PI * h.powi(5)) * (h - r.length()).powi(2) * r.normalize()
     } else {
         Vec2::ZERO
+    }
+}
+
+fn lap_viscocity(r: Vec2, h: f32) -> f32 {
+    if r.length() < h {
+        20.0 / (3.0 * PI * h.powi(5)) * (h - r.length())
+    } else {
+        0.0
     }
 }
 
