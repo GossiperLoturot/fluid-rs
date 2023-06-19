@@ -154,39 +154,29 @@ fn compute_position_and_velocity(particles: &mut [Particle]) {
 
 // renderer
 
-fn render_to_cui(particles: &[Particle]) {
+fn draw(particles: &[Particle]) {
     let mut text = String::new();
-    let mut amount_map = [[0; 10]; 10];
+    let mut amount = [[0; STDOUT_X]; STDOUT_Y];
 
     for i in 0..PARTICLE_SIZE {
-        let position = particles[i].position;
-
-        let x = (position.x / RANGE_X * 10.0).floor() as i32;
-        let y = (position.y / RANGE_Y * 10.0).floor() as i32;
-        if 0 <= x && x < 10 && 0 <= y && y < 10 {
-            amount_map[y as usize][x as usize] += 1;
+        let x = (particles[i].position.x / RANGE_X * STDOUT_X as f32).floor() as i32;
+        let y = (particles[i].position.y / RANGE_Y * STDOUT_Y as f32).floor() as i32;
+        if 0 <= x && x < STDOUT_X as i32 && 0 <= y && y < STDOUT_Y as i32 {
+            amount[y as usize][x as usize] += 1;
         }
     }
 
-    for i in 0..10 {
-        for j in 0..10 {
-            let amount = amount_map[i][j];
-            text.push(if amount == 0 {
-                ' '
-            } else if amount < 16 {
-                '.'
-            } else if amount < 32 {
-                '-'
-            } else if amount < 64 {
-                '='
-            } else if amount < 128 {
-                '*'
-            } else if amount < 256 {
-                '%'
-            } else if amount < 512 {
-                '$'
-            } else {
-                '#'
+    for y in (0..STDOUT_Y).rev() {
+        for x in 0..STDOUT_X {
+            text.push(match amount[y][x] {
+                a if a < 1 => ' ',
+                a if a < 2 => '.',
+                a if a < 3 => '-',
+                a if a < 4 => '=',
+                a if a < 5 => '*',
+                a if a < 6 => '%',
+                a if a < 7 => '$',
+                _ => '#',
             });
         }
         text.push('\n');
@@ -214,7 +204,7 @@ fn main() {
             compute_position_and_velocity(&mut particles);
         }
 
-        render_to_cui(&particles);
+        draw(&particles);
 
         std::thread::sleep(std::time::Duration::from_secs_f32(
             TIME_STEP * ITERATE as f32,
