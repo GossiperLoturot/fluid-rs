@@ -7,6 +7,10 @@ edition = "2021"
 name = "2d"
 path = "src/2d.rs"
 
+[[bin]]
+name = "3d"
+path = "src/3d.rs"
+
 [dependencies]
 glam = "0.24"
 rand = "0.8"
