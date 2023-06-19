@@ -1,18 +1,19 @@
 use glam::*;
 use rand::Rng;
 
-const PARTICLE_SIZE: usize = 1024;
-const PARTICLE_RADIUS: f32 = 0.012;
-const PARTICLE_MASS: f32 = 0.0002;
-const VISCOSITY: f32 = 0.1;
-const PRESSURE_STIFFNESS: f32 = 200.0;
-const REST_DENSITY: f32 = 1000.0;
-const TIME_STEP: f32 = 0.01666;
-const WALL_STIFNESS: f32 = 3000.0;
+const PARTICLE_SIZE: usize = 256;
+const PARTICLE_RADIUS: f32 = 0.1;
+const PARTICLE_MASS: f32 = 1.0;
+const VISCOSITY: f32 = 0.15;
+const PRESSURE_STIFFNESS: f32 = 50.0;
+const REST_DENSITY: f32 = 500.0;
+const TIME_STEP: f32 = 0.0001;
+const VELOCITY_DUMPING: f32 = -0.5;
 const GRAVITY_ACCELERATION: f32 = 9.8;
 const RANGE_X: f32 = 1.0;
 const RANGE_Y: f32 = 1.0;
 const PI: f32 = std::f32::consts::PI;
+const ITERATE: usize = 256;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct Particle {
@@ -20,7 +21,7 @@ struct Particle {
     velocity: Vec2,
     density: f32,
     pressure: f32,
-    force: Vec2,
+    acceleration: Vec2,
 }
 
 fn poly6(r: Vec2, h: f32) -> f32 {
@@ -47,7 +48,9 @@ fn grad_spiky(r: Vec2, h: f32) -> Vec2 {
     }
 }
 
-fn compute_density(particles: &mut [Particle]) {
+// refered from "Becker and Teschner, Weakly compressible SPH for free surface flows, SCA2007."
+
+fn compute_density_and_pressure(particles: &mut [Particle]) {
     for i in 0..PARTICLE_SIZE {
         particles[i].density = 0.0;
 
@@ -58,23 +61,19 @@ fn compute_density(particles: &mut [Particle]) {
 
             particles[i].density += PARTICLE_MASS
                 * poly6(
-                    particles[j].position - particles[i].position,
+                    particles[i].position - particles[j].position,
                     PARTICLE_RADIUS,
                 );
         }
-    }
-}
 
-fn compute_pressure(particles: &mut [Particle]) {
-    for i in 0..PARTICLE_SIZE {
         particles[i].pressure =
             PRESSURE_STIFFNESS * ((particles[i].density / REST_DENSITY).powi(7) - 1.0).max(0.0);
     }
 }
 
-fn compute_force(particles: &mut [Particle]) {
+fn compute_acceleration(particles: &mut [Particle]) {
     for i in 0..PARTICLE_SIZE {
-        particles[i].force = Vec2::ZERO;
+        particles[i].acceleration = Vec2::ZERO;
 
         for j in 0..PARTICLE_SIZE {
             if i == j {
@@ -82,52 +81,54 @@ fn compute_force(particles: &mut [Particle]) {
             }
 
             // viscosity force
-            particles[i].force +=
+            let acceleration =
                 VISCOSITY * PARTICLE_MASS * (particles[j].velocity - particles[i].velocity)
-                    / particles[j].density
+                    / (particles[i].density + particles[j].density)
                     * lap_viscocity(
-                        particles[j].position - particles[i].position,
+                        particles[i].position - particles[j].position,
                         PARTICLE_RADIUS,
                     );
+            if !acceleration.is_nan() {
+                particles[i].acceleration += acceleration;
+            }
 
             // pressure force
-            particles[i].force += -1.0 / particles[i].density
-                * PARTICLE_MASS
-                * (particles[j].pressure - particles[i].pressure)
-                / (2.0 * particles[j].density)
+            let acceleration = -PARTICLE_MASS
+                * (particles[i].pressure / particles[i].density.powi(2)
+                    + particles[j].pressure / particles[j].density.powi(2))
                 * grad_spiky(
-                    particles[j].position - particles[i].position,
+                    particles[i].position - particles[j].position,
                     PARTICLE_RADIUS,
                 );
+            if !acceleration.is_nan() {
+                particles[i].acceleration += acceleration;
+            }
+
         }
+
+        particles[i].acceleration += Vec2::NEG_Y * GRAVITY_ACCELERATION;
     }
 }
 
 fn compute_position_and_velocity(particles: &mut [Particle]) {
     for i in 0..PARTICLE_SIZE {
-        let external_acceleration = Vec2::NEG_Y * GRAVITY_ACCELERATION;
+        particles[i].velocity += particles[i].acceleration * TIME_STEP;
+        particles[i].position += particles[i].velocity * TIME_STEP;
 
-        let mut penalty_acceleration = Vec2::ZERO;
-        penalty_acceleration +=
-            particles[i].position.dot(Vec2::NEG_X).max(0.0) * WALL_STIFNESS * Vec2::X;
-        penalty_acceleration +=
-            (particles[i].position.dot(Vec2::X) - RANGE_X).max(0.0) * WALL_STIFNESS * Vec2::NEG_X;
-        penalty_acceleration +=
-            particles[i].position.dot(Vec2::NEG_Y).max(0.0) * WALL_STIFNESS * Vec2::Y;
-        penalty_acceleration +=
-            (particles[i].position.dot(Vec2::Y) - RANGE_Y).max(0.0) * WALL_STIFNESS * Vec2::NEG_Y;
-
-        let mut acceleration = particles[i].force / particles[i].density;
-        if acceleration.is_nan() {
-            acceleration = Vec2::ZERO;
+        if particles[i].position.x < 0.0 {
+            particles[i].position.x = 0.0;
+            particles[i].velocity.x *= VELOCITY_DUMPING;
+        } else if RANGE_X < particles[i].position.x {
+            particles[i].position.x = RANGE_X;
+            particles[i].velocity.x *= VELOCITY_DUMPING;
         }
-
-        let acceleration = acceleration + external_acceleration + penalty_acceleration;
-        let velocity = particles[i].velocity + acceleration * TIME_STEP;
-        let position = particles[i].position + velocity * TIME_STEP;
-
-        particles[i].velocity = velocity;
-        particles[i].position = position;
+        if particles[i].position.y < 0.0 {
+            particles[i].position.y = 0.0;
+            particles[i].velocity.y *= VELOCITY_DUMPING;
+        } else if RANGE_Y < particles[i].position.y {
+            particles[i].position.y = RANGE_Y;
+            particles[i].velocity.y *= VELOCITY_DUMPING;
+        }
     }
 }
 
@@ -182,13 +183,16 @@ fn main() {
     }
 
     loop {
-        compute_density(&mut particles);
-        compute_pressure(&mut particles);
-        compute_force(&mut particles);
-        compute_position_and_velocity(&mut particles);
+        for _ in 0..ITERATE {
+            compute_density_and_pressure(&mut particles);
+            compute_acceleration(&mut particles);
+            compute_position_and_velocity(&mut particles);
+        }
 
         render_to_cui(&particles);
 
-        std::thread::sleep(std::time::Duration::from_secs_f32(TIME_STEP));
+        std::thread::sleep(std::time::Duration::from_secs_f32(
+            TIME_STEP * ITERATE as f32,
+        ));
     }
 }
