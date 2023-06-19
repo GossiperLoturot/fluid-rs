@@ -3,6 +3,10 @@ name = "fluid-rs"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "2d"
+path = "src/2d.rs"
+
 [dependencies]
 glam = "0.24"
 rand = "0.8"
