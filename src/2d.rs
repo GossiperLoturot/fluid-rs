@@ -1,153 +1,208 @@
 use glam::*;
 use rand::Rng;
 
-// simulation params
-const ITERATE: usize = 256;
-const TIME_STEP: f32 = 0.0001;
-const PARTICLE_SIZE: usize = 256;
-const PARTICLE_RADIUS: f32 = 0.1;
-const PARTICLE_MASS: f32 = 1.0;
+const DT: f32 = 0.2;
+const ITERATIONS: i32 = (1.0 / DT) as i32;
 
-// viscosity params
-const VISCOSITY: f32 = 0.15;
+const PARTICLE_SIZE: i32 = 1024;
+const GRID_RES: i32 = 64;
 
-// pressure params
-const PRESSURE_STIFFNESS: f32 = 50.0;
-const REST_DENSITY: f32 = 500.0;
+const GRAVITY: Vec2 = Vec2::new(0.0, -0.3);
+const REST_DENSITY: f32 = 4.0;
+const DYNAMIC_VISCOSITY: f32 = 0.1;
+const EOS_STIFFNESS: f32 = 10.0;
+const EOS_POWER: f32 = 4.0;
 
-// bounds params
-const VELOCITY_DUMPING: f32 = -0.5;
-const RANGE_X: f32 = 1.0;
-const RANGE_Y: f32 = 1.0;
+const STDOUT_SIZE: IVec2 = IVec2::new(80, 40);
 
-// renderer params
-const STDOUT_X: usize = 32;
-const STDOUT_Y: usize = 16;
-
-// constant
-const PI: f32 = std::f32::consts::PI;
-const GRAVITY_ACCELERATION: f32 = 9.8;
-
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 struct Particle {
-    position: Vec2,
-    velocity: Vec2,
-    acceleration: Vec2,
-    density: f32,
-    pressure: f32,
+    x: Vec2,
+    v: Vec2,
+    c_mat: Mat2,
+    m: f32,
 }
 
-// kernel functions
+#[derive(Default, Clone, Copy)]
+struct Cell {
+    v: Vec2,
+    m: f32,
+}
 
-fn poly6(r: Vec2, h: f32) -> f32 {
-    if r.length() < h {
-        4.0 / (PI * h.powi(8)) * (h.powi(2) - r.length_squared()).powi(3)
-    } else {
-        0.0
+// pipeline
+
+fn clear_grid(grid: &mut [Cell]) {
+    for i in 0..GRID_RES * GRID_RES {
+        grid[i as usize].v = Vec2::ZERO;
+        grid[i as usize].m = 0.0;
     }
 }
 
-fn grad_spiky(r: Vec2, h: f32) -> Vec2 {
-    if r.length() < h {
-        -30.0 / (PI * h.powi(5)) * (h - r.length()).powi(2) * r.normalize()
-    } else {
-        Vec2::ZERO
-    }
-}
-
-fn lap_viscocity(r: Vec2, h: f32) -> f32 {
-    if r.length() < h {
-        20.0 / (3.0 * PI * h.powi(5)) * (h - r.length())
-    } else {
-        0.0
-    }
-}
-
-// pipeline functions
-// refered from "Becker and Teschner, Weakly compressible SPH for free surface flows, SCA2007."
-
-fn compute_density_and_pressure(particles: &mut [Particle]) {
+fn p2g_1(particles: &[Particle], grid: &mut [Cell]) {
     for i in 0..PARTICLE_SIZE {
-        particles[i].density = 0.0;
+        let p = &particles[i as usize];
 
-        for j in 0..PARTICLE_SIZE {
-            if i == j {
-                continue;
+        let cell_idx = p.x.floor().as_ivec2();
+        let cell_diff = p.x - cell_idx.as_vec2() - Vec2::splat(0.5);
+
+        let w = [
+            0.5 * (0.5 - cell_diff).powf(2.0),
+            0.75 - cell_diff.powf(2.0),
+            0.5 * (0.5 + cell_diff).powf(2.0),
+        ];
+
+        for gy in 0..3 {
+            for gx in 0..3 {
+                let weight = w[gx].x * w[gy].y;
+
+                let cell_x = cell_idx + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                let cell_dist = cell_x.as_vec2() - p.x + Vec2::splat(0.5);
+                let q = p.c_mat * cell_dist;
+
+                let mass_contrib = weight * p.m;
+
+                let cell = &mut grid[(cell_x.y * GRID_RES + cell_x.x) as usize];
+                cell.m += mass_contrib;
+                cell.v += mass_contrib * (p.v + q);
+            }
+        }
+    }
+}
+
+fn p2g_2(particles: &[Particle], grid: &mut [Cell]) {
+    for i in 0..PARTICLE_SIZE {
+        let p = &particles[i as usize];
+
+        let cell_idx = p.x.floor().as_ivec2();
+        let cell_diff = p.x - cell_idx.as_vec2() - Vec2::splat(0.5);
+
+        let w = [
+            0.5 * (0.5 - cell_diff).powf(2.0),
+            0.75 - cell_diff.powf(2.0),
+            0.5 * (0.5 + cell_diff).powf(2.0),
+        ];
+
+        let mut density = 0.0;
+        for gy in 0..3 {
+            for gx in 0..3 {
+                let weight = w[gx].x * w[gy].y;
+
+                let cell_x = cell_idx + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+
+                density += grid[(cell_x.y * GRID_RES + cell_x.x) as usize].m * weight;
+            }
+        }
+        let volume = p.m / density;
+
+        let pressure = f32::max(
+            -0.1,
+            EOS_STIFFNESS * ((density / REST_DENSITY).powf(EOS_POWER) - 1.0),
+        );
+
+        let mut strain = p.c_mat;
+        let trace = strain.y_axis.x + strain.x_axis.y;
+        strain.y_axis.x = trace;
+        strain.x_axis.y = trace;
+
+        let viscosity_term = DYNAMIC_VISCOSITY * strain;
+        let stress = -pressure * Mat2::IDENTITY + viscosity_term;
+
+        let eg_16_term_0 = 4.0 * -volume * stress * DT;
+
+        for gy in 0..3 {
+            for gx in 0..3 {
+                let weight = w[gx].x * w[gy].y;
+
+                let cell_x = cell_idx + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                let cell_dist = cell_x.as_vec2() - p.x + Vec2::splat(0.5);
+
+                let cell = &mut grid[(cell_x.y * GRID_RES + cell_x.x) as usize];
+                cell.v += weight * eg_16_term_0 * cell_dist;
+            }
+        }
+    }
+}
+
+fn update_grid(grid: &mut [Cell]) {
+    for i in 0..GRID_RES * GRID_RES {
+        let cell = &mut grid[i as usize];
+
+        if cell.m > 0.0 {
+            cell.v /= cell.m;
+            cell.v += DT * GRAVITY;
+
+            let x = i % GRID_RES;
+            if x < 2 || x > (GRID_RES - 1) - 2 {
+                cell.v.x = 0.0;
             }
 
-            // density
-            particles[i].density += PARTICLE_MASS
-                * poly6(
-                    particles[i].position - particles[j].position,
-                    PARTICLE_RADIUS,
+            let y = i / GRID_RES;
+            if y < 2 || y > (GRID_RES - 1) - 2 {
+                cell.v.y = 0.0;
+            }
+        }
+    }
+}
+
+fn g2p(particles: &mut [Particle], grid: &[Cell]) {
+    for i in 0..PARTICLE_SIZE {
+        let p = &mut particles[i as usize];
+
+        p.v = Vec2::ZERO;
+
+        let cell_idx = p.x.floor().as_ivec2();
+        let cell_diff = p.x - cell_idx.as_vec2() - Vec2::splat(0.5);
+
+        let w = [
+            0.5 * (0.5 - cell_diff).powf(2.0),
+            0.75 - cell_diff.powf(2.0),
+            0.5 * (0.5 + cell_diff).powf(2.0),
+        ];
+
+        let mut b_mat = Mat2::ZERO;
+        for gx in 0..3 {
+            for gy in 0..3 {
+                let weight = w[gx].x * w[gy].y;
+
+                let cell_x = cell_idx + IVec2::new(gx as i32 - 1, gy as i32 - 1);
+                let cell_dist = cell_x.as_vec2() - p.x + Vec2::splat(0.5);
+
+                let weighted_velocity = weight * grid[(cell_x.y * GRID_RES + cell_x.x) as usize].v;
+                let term = Mat2::from_cols(
+                    weighted_velocity * cell_dist.x,
+                    weighted_velocity * cell_dist.y,
                 );
-        }
+                b_mat += term;
 
-        // pressure
-        particles[i].pressure =
-            PRESSURE_STIFFNESS * ((particles[i].density / REST_DENSITY).powi(7) - 1.0).max(0.0);
-    }
-}
-
-fn compute_acceleration(particles: &mut [Particle]) {
-    for i in 0..PARTICLE_SIZE {
-        particles[i].acceleration = Vec2::ZERO;
-
-        for j in 0..PARTICLE_SIZE {
-            if i == j {
-                continue;
-            }
-
-            // pressure
-            let acceleration = -PARTICLE_MASS
-                * (particles[i].pressure / particles[i].density.powi(2)
-                    + particles[j].pressure / particles[j].density.powi(2))
-                * grad_spiky(
-                    particles[i].position - particles[j].position,
-                    PARTICLE_RADIUS,
-                );
-            if !acceleration.is_nan() {
-                particles[i].acceleration += acceleration;
-            }
-
-            // viscosity
-            let acceleration =
-                VISCOSITY * PARTICLE_MASS * (particles[j].velocity - particles[i].velocity)
-                    / (particles[i].density + particles[j].density)
-                    * lap_viscocity(
-                        particles[i].position - particles[j].position,
-                        PARTICLE_RADIUS,
-                    );
-            if !acceleration.is_nan() {
-                particles[i].acceleration += acceleration;
+                p.v += weighted_velocity;
             }
         }
 
-        // gravity
-        particles[i].acceleration += Vec2::NEG_Y * GRAVITY_ACCELERATION;
-    }
-}
+        p.c_mat = 4.0 * b_mat;
+        p.x += p.v * DT;
 
-fn compute_position_and_velocity(particles: &mut [Particle]) {
-    for i in 0..PARTICLE_SIZE {
-        // forward euler method
-        particles[i].velocity += particles[i].acceleration * TIME_STEP;
-        particles[i].position += particles[i].velocity * TIME_STEP;
+        // boundary conditions
 
-        // bounds
-        if particles[i].position.x < 0.0 {
-            particles[i].position.x = 0.0;
-            particles[i].velocity.x *= VELOCITY_DUMPING;
-        } else if RANGE_X < particles[i].position.x {
-            particles[i].position.x = RANGE_X;
-            particles[i].velocity.x *= VELOCITY_DUMPING;
+        p.x = Vec2::clamp(
+            p.x,
+            Vec2::splat(1.0),
+            IVec2::splat(GRID_RES - 1).as_vec2() - Vec2::splat(1.0),
+        );
+
+        let x_n = p.x + p.v;
+        let wall_min = 3.0;
+        let wall_max = (GRID_RES - 1) as f32 - 3.0;
+        if x_n.x < wall_min {
+            p.v.x += wall_min - x_n.x;
         }
-        if particles[i].position.y < 0.0 {
-            particles[i].position.y = 0.0;
-            particles[i].velocity.y *= VELOCITY_DUMPING;
-        } else if RANGE_Y < particles[i].position.y {
-            particles[i].position.y = RANGE_Y;
-            particles[i].velocity.y *= VELOCITY_DUMPING;
+        if x_n.x > wall_max {
+            p.v.x += wall_max - x_n.x;
+        }
+        if x_n.y < wall_min {
+            p.v.y += wall_min - x_n.y;
+        }
+        if x_n.y > wall_max {
+            p.v.y += wall_max - x_n.y;
         }
     }
 }
@@ -155,34 +210,34 @@ fn compute_position_and_velocity(particles: &mut [Particle]) {
 // renderer
 
 fn draw(particles: &[Particle]) {
-    let mut text = String::new();
-    let mut amount = [[0; STDOUT_X]; STDOUT_Y];
+    let mut bin_counts = [0; (STDOUT_SIZE.x * STDOUT_SIZE.y) as usize];
 
     for i in 0..PARTICLE_SIZE {
-        let x = (particles[i].position.x / RANGE_X * STDOUT_X as f32).floor() as i32;
-        let y = (particles[i].position.y / RANGE_Y * STDOUT_Y as f32).floor() as i32;
-        if 0 <= x && x < STDOUT_X as i32 && 0 <= y && y < STDOUT_Y as i32 {
-            amount[y as usize][x as usize] += 1;
+        let xyz = (particles[i as usize].x / Vec2::splat(GRID_RES as f32) * STDOUT_SIZE.as_vec2())
+            .as_ivec2();
+
+        if xyz.cmpge(IVec2::ZERO).all() && xyz.cmplt(STDOUT_SIZE).all() {
+            bin_counts[(xyz.y * STDOUT_SIZE.x + xyz.x) as usize] += 1;
         }
     }
 
-    for y in (0..STDOUT_Y).rev() {
-        for x in 0..STDOUT_X {
-            text.push(match amount[y][x] {
-                a if a < 1 => ' ',
-                a if a < 2 => '.',
-                a if a < 3 => '-',
-                a if a < 4 => '=',
-                a if a < 5 => '*',
-                a if a < 6 => '%',
-                a if a < 7 => '$',
-                _ => '#',
-            });
+    print!("\x1b[2J");
+    print!("\x1b[1;1H");
+    for y in 0..STDOUT_SIZE.y {
+        for x in 0..STDOUT_SIZE.x {
+            match bin_counts[(y * STDOUT_SIZE.x + x) as usize] {
+                n if n < 1 => print!(" "),
+                n if n < 2 => print!("."),
+                n if n < 3 => print!("-"),
+                n if n < 4 => print!("="),
+                n if n < 5 => print!("*"),
+                n if n < 6 => print!("%"),
+                n if n < 7 => print!("$"),
+                _ => print!("#"),
+            };
         }
-        text.push('\n');
+        println!();
     }
-
-    print!("\x1b[2J\x1b[1;1H{}", text);
 }
 
 // main routine
@@ -190,24 +245,35 @@ fn draw(particles: &[Particle]) {
 fn main() {
     let mut rng = rand::thread_rng();
 
-    // spawn particle
-    let mut particles = [Particle::default(); PARTICLE_SIZE];
+    let mut particles = [Particle::default(); PARTICLE_SIZE as usize];
+    let mut grid = [Cell::default(); (GRID_RES * GRID_RES) as usize];
+
     for i in 0..PARTICLE_SIZE {
-        particles[i].position =
-            Vec2::new(rng.gen_range(0.0..=RANGE_X), rng.gen_range(0.0..=RANGE_Y));
+        let x = rng.gen_range(24.0..=40.0);
+        let y = rng.gen_range(24.0..=40.0);
+        particles[i as usize].x = Vec2::new(x, y);
+        particles[i as usize].v = Vec2::ZERO;
+        particles[i as usize].c_mat = Mat2::ZERO;
+        particles[i as usize].m = 1.0;
     }
 
-    loop {
-        for _ in 0..ITERATE {
-            compute_density_and_pressure(&mut particles);
-            compute_acceleration(&mut particles);
-            compute_position_and_velocity(&mut particles);
-        }
+    for i in 0..GRID_RES * GRID_RES {
+        grid[i as usize].v = Vec2::ZERO;
+        grid[i as usize].m = 0.0;
+    }
 
+    let time = std::time::Duration::from_secs_f32(DT);
+    loop {
         draw(&particles);
 
-        std::thread::sleep(std::time::Duration::from_secs_f32(
-            TIME_STEP * ITERATE as f32,
-        ));
+        for _ in 0..ITERATIONS {
+            clear_grid(&mut grid);
+            p2g_1(&particles, &mut grid);
+            p2g_2(&particles, &mut grid);
+            update_grid(&mut grid);
+            g2p(&mut particles, &grid);
+        }
+
+        std::thread::sleep(time);
     }
 }
