@@ -1,19 +1,24 @@
+use std::io::Write;
+
+use crossterm::{style::Stylize, ExecutableCommand};
 use glam::*;
 use rand::Rng;
 
-const DT: f32 = 0.2;
+const DT: f32 = 0.032;
 const ITERATIONS: i32 = (1.0 / DT) as i32;
 
-const PARTICLE_SIZE: i32 = 1024;
+const PARTICLE_SIZE: i32 = 4096;
 const GRID_RES: i32 = 64;
 
-const GRAVITY: Vec2 = Vec2::new(0.0, -0.3);
+const GRAVITY: Vec2 = Vec2::new(0.0, 0.3);
 const REST_DENSITY: f32 = 4.0;
 const DYNAMIC_VISCOSITY: f32 = 0.1;
 const EOS_STIFFNESS: f32 = 10.0;
 const EOS_POWER: f32 = 4.0;
 
 const STDOUT_SIZE: IVec2 = IVec2::new(80, 40);
+
+const ENFORCE_RADIUS: f32 = 10.0;
 
 #[derive(Default, Clone, Copy)]
 struct Particle {
@@ -144,7 +149,7 @@ fn update_grid(grid: &mut [Cell]) {
     }
 }
 
-fn g2p(particles: &mut [Particle], grid: &[Cell]) {
+fn g2p(particles: &mut [Particle], grid: &[Cell], enforce: &Option<Vec2>) {
     for i in 0..PARTICLE_SIZE {
         let p = &mut particles[i as usize];
 
@@ -181,6 +186,15 @@ fn g2p(particles: &mut [Particle], grid: &[Cell]) {
         p.c_mat = 4.0 * b_mat;
         p.x += p.v * DT;
 
+        // enforce
+
+        if let Some(enforce_x) = enforce {
+            let dist = p.x - enforce_x;
+            if dist.length_squared() < ENFORCE_RADIUS * ENFORCE_RADIUS {
+                p.v += dist.normalize_or_zero();
+            }
+        }
+
         // boundary conditions
 
         p.x = Vec2::clamp(
@@ -207,9 +221,57 @@ fn g2p(particles: &mut [Particle], grid: &[Cell]) {
     }
 }
 
-// renderer
+// console input
 
-fn draw(particles: &[Particle]) {
+#[derive(Clone, Copy)]
+enum Event {
+    Quit,
+    Drag(u16, u16),
+    Resize(u16, u16),
+}
+
+fn input_handle(tx: crossbeam_channel::Sender<Event>) {
+    loop {
+        match crossterm::event::read() {
+            Ok(event) => match event {
+                crossterm::event::Event::Key(key_event) => {
+                    if key_event.code == crossterm::event::KeyCode::Char('q') {
+                        let _ = tx.send(Event::Quit);
+                    }
+                }
+                crossterm::event::Event::Mouse(mouse_event) => {
+                    if matches!(mouse_event.kind, crossterm::event::MouseEventKind::Down(_)) {
+                        let _ = tx.try_send(Event::Drag(mouse_event.column, mouse_event.row));
+                    }
+                    if matches!(mouse_event.kind, crossterm::event::MouseEventKind::Drag(_)) {
+                        let _ = tx.try_send(Event::Drag(mouse_event.column, mouse_event.row));
+                    }
+                }
+                crossterm::event::Event::Resize(x, y) => {
+                    let _ = tx.send(Event::Resize(x, y));
+                }
+                _ => {}
+            },
+            Err(_) => {}
+        }
+    }
+}
+
+// console output
+
+fn draw_base<T: Write + ?Sized>(out: &mut T) -> std::io::Result<()> {
+    out.execute(crossterm::terminal::Clear(
+        crossterm::terminal::ClearType::All,
+    ))?;
+
+    let msg = "2D MLS-MPM Fluid Simulation -- [Drag mouse] Interact, [q] Quit.";
+    out.execute(crossterm::cursor::MoveTo(0, STDOUT_SIZE.y as u16))?
+        .execute(crossterm::style::Print(msg.dark_green().bold()))?;
+
+    Ok(())
+}
+
+fn draw<T: Write + ?Sized>(particles: &[Particle], out: &mut T) -> std::io::Result<()> {
     let mut bin_counts = [0; (STDOUT_SIZE.x * STDOUT_SIZE.y) as usize];
 
     for i in 0..PARTICLE_SIZE {
@@ -221,36 +283,38 @@ fn draw(particles: &[Particle]) {
         }
     }
 
-    print!("\x1b[2J");
-    print!("\x1b[1;1H");
     for y in 0..STDOUT_SIZE.y {
+        out.execute(crossterm::cursor::MoveTo(0, y as u16))?;
         for x in 0..STDOUT_SIZE.x {
-            match bin_counts[(y * STDOUT_SIZE.x + x) as usize] {
-                n if n < 1 => print!(" "),
-                n if n < 2 => print!("."),
-                n if n < 3 => print!("-"),
-                n if n < 4 => print!("="),
-                n if n < 5 => print!("*"),
-                n if n < 6 => print!("%"),
-                n if n < 7 => print!("$"),
-                _ => print!("#"),
+            let ch = match bin_counts[(y * STDOUT_SIZE.x + x) as usize] {
+                n if n < 1 => b' ',
+                n if n < 2 => b'.',
+                n if n < 3 => b'-',
+                n if n < 4 => b'=',
+                n if n < 5 => b'*',
+                n if n < 6 => b'%',
+                n if n < 7 => b'$',
+                _ => b'#',
             };
+            out.write_all(&[ch])?;
         }
-        println!();
     }
+    Ok(())
 }
 
 // main routine
 
-fn main() {
-    let mut rng = rand::thread_rng();
+fn main() -> std::io::Result<()> {
+    let mut rng = rand::rng();
+
+    let time = std::time::Duration::from_secs_f32(DT);
 
     let mut particles = [Particle::default(); PARTICLE_SIZE as usize];
     let mut grid = [Cell::default(); (GRID_RES * GRID_RES) as usize];
 
     for i in 0..PARTICLE_SIZE {
-        let x = rng.gen_range(24.0..=40.0);
-        let y = rng.gen_range(24.0..=40.0);
+        let x = rng.random_range(16.0..=48.0);
+        let y = rng.random_range(16.0..=48.0);
         particles[i as usize].x = Vec2::new(x, y);
         particles[i as usize].v = Vec2::ZERO;
         particles[i as usize].c_mat = Mat2::ZERO;
@@ -262,18 +326,56 @@ fn main() {
         grid[i as usize].m = 0.0;
     }
 
-    let time = std::time::Duration::from_secs_f32(DT);
+    let mut out = std::io::BufWriter::new(std::io::stdout());
+
+    crossterm::terminal::enable_raw_mode()?;
+    out.execute(crossterm::terminal::EnterAlternateScreen)?;
+    out.execute(crossterm::cursor::Hide)?;
+    out.execute(crossterm::event::EnableMouseCapture)?;
+
+    draw_base(&mut out)?;
+
+    let (tx, rx) = crossbeam_channel::bounded::<Event>(1);
+    std::thread::spawn(|| input_handle(tx));
     loop {
-        draw(&particles);
+        let mut enforce = None;
+
+        match rx.try_recv() {
+            Ok(event) => match event {
+                Event::Quit => break,
+                Event::Drag(x, y) => {
+                    let x = x as f32 / STDOUT_SIZE.x as f32 * GRID_RES as f32;
+                    let y = y as f32 / STDOUT_SIZE.y as f32 * GRID_RES as f32;
+                    enforce = Some(Vec2::new(x, y));
+                }
+                Event::Resize(width, height) => {
+                    if width < STDOUT_SIZE.x as u16 || height < STDOUT_SIZE.y as u16 {
+                        break;
+                    }
+                    draw_base(&mut out)?;
+                }
+            },
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+        }
+
+        draw(&particles, &mut out)?;
 
         for _ in 0..ITERATIONS {
             clear_grid(&mut grid);
             p2g_1(&particles, &mut grid);
             p2g_2(&particles, &mut grid);
             update_grid(&mut grid);
-            g2p(&mut particles, &grid);
+            g2p(&mut particles, &grid, &enforce);
         }
 
         std::thread::sleep(time);
     }
+
+    out.execute(crossterm::event::DisableMouseCapture)?;
+    out.execute(crossterm::cursor::Show)?;
+    out.execute(crossterm::terminal::LeaveAlternateScreen)?;
+    crossterm::terminal::disable_raw_mode()?;
+
+    Ok(())
 }
