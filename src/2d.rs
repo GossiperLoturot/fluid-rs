@@ -1,292 +1,368 @@
-use std::io::Write;
-
-use crossterm::{style::Stylize, ExecutableCommand};
 use glam::*;
-use rand::Rng;
 
-const DT: f32 = 0.032;
-const ITERATIONS: i32 = (1.0 / DT) as i32;
+struct Config {
+    dt: f32,
+    iterations: i32,
+    particle_size: i32,
+    grid_res: i32,
+    gravity: Vec2,
+    rest_density: f32,
+    dynamic_viscosity: f32,
+    eos_stiffness: f32,
+    eos_power: f32,
+    mouse_radius: f32,
+    boundary_clip: f32,
+    boundary_damp: f32,
+    console_size: IVec2,
+}
 
-const PARTICLE_SIZE: i32 = 4096;
-const GRID_RES: i32 = 64;
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            dt: 0.032,
+            iterations: (1.0 / 0.032) as i32,
+            particle_size: 4096,
+            grid_res: 64,
+            gravity: Vec2::new(0.0, 0.3),
+            rest_density: 4.0,
+            dynamic_viscosity: 0.1,
+            eos_stiffness: 10.0,
+            eos_power: 4.0,
+            mouse_radius: 10.0,
+            boundary_clip: 1.0,
+            boundary_damp: 3.0,
+            console_size: IVec2::new(80, 40),
+        }
+    }
+}
 
-const GRAVITY: Vec2 = Vec2::new(0.0, 0.3);
-const REST_DENSITY: f32 = 4.0;
-const DYNAMIC_VISCOSITY: f32 = 0.1;
-const EOS_STIFFNESS: f32 = 10.0;
-const EOS_POWER: f32 = 4.0;
-
-const STDOUT_SIZE: IVec2 = IVec2::new(80, 40);
-
-const ENFORCE_RADIUS: f32 = 10.0;
-
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct Particle {
-    x: Vec2,
-    v: Vec2,
-    c_mat: Mat2,
-    m: f32,
+    pos: Vec2,
+    vel: Vec2,
+    affine_momentum: Mat2,
+    mass: f32,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct Cell {
-    v: Vec2,
-    m: f32,
+    vel: Vec2,
+    mass: f32,
 }
 
-// pipeline
-
-fn clear_grid(grid: &mut [Cell]) {
-    for i in 0..GRID_RES * GRID_RES {
-        grid[i as usize].v = Vec2::ZERO;
-        grid[i as usize].m = 0.0;
-    }
+struct Simulation {
+    config: Config,
+    particles: Vec<Particle>,
+    grid: Vec<Cell>,
 }
 
-fn p2g_1(particles: &[Particle], grid: &mut [Cell]) {
-    for i in 0..PARTICLE_SIZE {
-        let p = &particles[i as usize];
+impl Simulation {
+    fn new(config: Config) -> Self {
+        let particles = vec![Particle::default(); config.particle_size as usize];
 
-        let cell_idx = p.x.floor().as_ivec2();
-        let cell_diff = p.x - cell_idx.as_vec2() - Vec2::splat(0.5);
+        let grid_size = config.grid_res * config.grid_res;
+        let grid = vec![Cell::default(); grid_size as usize];
 
-        let w = [
-            0.5 * (0.5 - cell_diff).powf(2.0),
-            0.75 - cell_diff.powf(2.0),
-            0.5 * (0.5 + cell_diff).powf(2.0),
-        ];
-
-        for gy in 0..3 {
-            for gx in 0..3 {
-                let weight = w[gx].x * w[gy].y;
-
-                let cell_x = cell_idx + IVec2::new(gx as i32 - 1, gy as i32 - 1);
-                let cell_dist = cell_x.as_vec2() - p.x + Vec2::splat(0.5);
-                let q = p.c_mat * cell_dist;
-
-                let mass_contrib = weight * p.m;
-
-                let cell = &mut grid[(cell_x.y * GRID_RES + cell_x.x) as usize];
-                cell.m += mass_contrib;
-                cell.v += mass_contrib * (p.v + q);
-            }
+        Self {
+            config,
+            particles,
+            grid,
         }
     }
-}
 
-fn p2g_2(particles: &[Particle], grid: &mut [Cell]) {
-    for i in 0..PARTICLE_SIZE {
-        let p = &particles[i as usize];
+    fn initialize_particles(&mut self) {
+        use rand::Rng;
 
-        let cell_idx = p.x.floor().as_ivec2();
-        let cell_diff = p.x - cell_idx.as_vec2() - Vec2::splat(0.5);
+        let mut rng = rand::rng();
 
-        let w = [
-            0.5 * (0.5 - cell_diff).powf(2.0),
-            0.75 - cell_diff.powf(2.0),
-            0.5 * (0.5 + cell_diff).powf(2.0),
-        ];
-
-        let mut density = 0.0;
-        for gy in 0..3 {
-            for gx in 0..3 {
-                let weight = w[gx].x * w[gy].y;
-
-                let cell_x = cell_idx + IVec2::new(gx as i32 - 1, gy as i32 - 1);
-
-                density += grid[(cell_x.y * GRID_RES + cell_x.x) as usize].m * weight;
-            }
-        }
-        let volume = p.m / density;
-
-        let pressure = f32::max(
-            -0.1,
-            EOS_STIFFNESS * ((density / REST_DENSITY).powf(EOS_POWER) - 1.0),
-        );
-
-        let mut strain = p.c_mat;
-        let trace = strain.y_axis.x + strain.x_axis.y;
-        strain.y_axis.x = trace;
-        strain.x_axis.y = trace;
-
-        let viscosity_term = DYNAMIC_VISCOSITY * strain;
-        let stress = -pressure * Mat2::IDENTITY + viscosity_term;
-
-        let eg_16_term_0 = 4.0 * -volume * stress * DT;
-
-        for gy in 0..3 {
-            for gx in 0..3 {
-                let weight = w[gx].x * w[gy].y;
-
-                let cell_x = cell_idx + IVec2::new(gx as i32 - 1, gy as i32 - 1);
-                let cell_dist = cell_x.as_vec2() - p.x + Vec2::splat(0.5);
-
-                let cell = &mut grid[(cell_x.y * GRID_RES + cell_x.x) as usize];
-                cell.v += weight * eg_16_term_0 * cell_dist;
-            }
+        for p in self.particles.iter_mut() {
+            let x = rng.random_range(16.0..=48.0);
+            let y = rng.random_range(16.0..=48.0);
+            p.pos = Vec2::new(x, y);
+            p.vel = Vec2::ZERO;
+            p.affine_momentum = Mat2::ZERO;
+            p.mass = 1.0;
         }
     }
-}
 
-fn update_grid(grid: &mut [Cell]) {
-    for i in 0..GRID_RES * GRID_RES {
-        let cell = &mut grid[i as usize];
-
-        if cell.m > 0.0 {
-            cell.v /= cell.m;
-            cell.v += DT * GRAVITY;
-
-            let x = i % GRID_RES;
-            if x < 2 || x > (GRID_RES - 1) - 2 {
-                cell.v.x = 0.0;
-            }
-
-            let y = i / GRID_RES;
-            if y < 2 || y > (GRID_RES - 1) - 2 {
-                cell.v.y = 0.0;
-            }
+    fn step(&mut self, mouse_pos: &Option<Vec2>) {
+        for _ in 0..self.config.iterations {
+            self.clear_grid();
+            self.p2g_1();
+            self.p2g_2();
+            self.update_grid();
+            self.g2p(mouse_pos);
         }
     }
-}
 
-fn g2p(particles: &mut [Particle], grid: &[Cell], enforce: &Option<Vec2>) {
-    for i in 0..PARTICLE_SIZE {
-        let p = &mut particles[i as usize];
+    fn clear_grid(&mut self) {
+        for cell in self.grid.iter_mut() {
+            cell.vel = Vec2::ZERO;
+            cell.mass = 0.0;
+        }
+    }
 
-        p.v = Vec2::ZERO;
+    fn p2g_1(&mut self) {
+        let grid_res = self.config.grid_res;
 
-        let cell_idx = p.x.floor().as_ivec2();
-        let cell_diff = p.x - cell_idx.as_vec2() - Vec2::splat(0.5);
+        for p in self.particles.iter() {
+            let cell_idx = p.pos.floor().as_ivec2();
+            let cell_diff = p.pos - cell_idx.as_vec2() - Vec2::splat(0.5);
+            let w = Self::quadratic_weights(cell_diff);
 
-        let w = [
-            0.5 * (0.5 - cell_diff).powf(2.0),
-            0.75 - cell_diff.powf(2.0),
-            0.5 * (0.5 + cell_diff).powf(2.0),
-        ];
-
-        let mut b_mat = Mat2::ZERO;
-        for gx in 0..3 {
             for gy in 0..3 {
-                let weight = w[gx].x * w[gy].y;
+                for gx in 0..3 {
+                    let weight = w[gx as usize].x * w[gy as usize].y;
+                    let cell_pos = cell_idx + IVec2::new(gx - 1, gy - 1);
+                    let cell_dist = cell_pos.as_vec2() - p.pos + Vec2::splat(0.5);
 
-                let cell_x = cell_idx + IVec2::new(gx as i32 - 1, gy as i32 - 1);
-                let cell_dist = cell_x.as_vec2() - p.x + Vec2::splat(0.5);
+                    let q = p.affine_momentum * cell_dist;
+                    let mass_contrib = weight * p.mass;
 
-                let weighted_velocity = weight * grid[(cell_x.y * GRID_RES + cell_x.x) as usize].v;
-                let term = Mat2::from_cols(
-                    weighted_velocity * cell_dist.x,
-                    weighted_velocity * cell_dist.y,
-                );
-                b_mat += term;
-
-                p.v += weighted_velocity;
+                    let grid_idx = (cell_pos.y * grid_res + cell_pos.x) as usize;
+                    let cell = &mut self.grid[grid_idx];
+                    cell.mass += mass_contrib;
+                    cell.vel += mass_contrib * (p.vel + q);
+                }
             }
-        }
-
-        p.c_mat = 4.0 * b_mat;
-        p.x += p.v * DT;
-
-        // enforce
-
-        if let Some(enforce_x) = enforce {
-            let dist = p.x - enforce_x;
-            if dist.length_squared() < ENFORCE_RADIUS * ENFORCE_RADIUS {
-                p.v += dist.normalize_or_zero();
-            }
-        }
-
-        // boundary conditions
-
-        p.x = Vec2::clamp(
-            p.x,
-            Vec2::splat(1.0),
-            IVec2::splat(GRID_RES - 1).as_vec2() - Vec2::splat(1.0),
-        );
-
-        let x_n = p.x + p.v;
-        let wall_min = 3.0;
-        let wall_max = (GRID_RES - 1) as f32 - 3.0;
-        if x_n.x < wall_min {
-            p.v.x += wall_min - x_n.x;
-        }
-        if x_n.x > wall_max {
-            p.v.x += wall_max - x_n.x;
-        }
-        if x_n.y < wall_min {
-            p.v.y += wall_min - x_n.y;
-        }
-        if x_n.y > wall_max {
-            p.v.y += wall_max - x_n.y;
         }
     }
-}
 
-// console input
+    fn p2g_2(&mut self) {
+        let grid_res = self.config.grid_res;
+        let rest_density = self.config.rest_density;
+        let eos_stiffness = self.config.eos_stiffness;
+        let eos_power = self.config.eos_power;
+        let dynamic_viscosity = self.config.dynamic_viscosity;
+        let dt = self.config.dt;
+
+        for p in self.particles.iter() {
+            let cell_idx = p.pos.floor().as_ivec2();
+            let cell_diff = p.pos - cell_idx.as_vec2() - Vec2::splat(0.5);
+            let w = Self::quadratic_weights(cell_diff);
+
+            let mut density = 0.0;
+            for gy in 0..3 {
+                for gx in 0..3 {
+                    let weight = w[gx as usize].x * w[gy as usize].y;
+                    let cell_pos = cell_idx + IVec2::new(gx - 1, gy - 1);
+
+                    let grid_idx = (cell_pos.y * grid_res + cell_pos.x) as usize;
+                    density += self.grid[grid_idx].mass * weight;
+                }
+            }
+            let volume = p.mass / density;
+            let pressure = f32::max(
+                -0.1,
+                eos_stiffness * ((density / rest_density).powf(eos_power) - 1.0),
+            );
+
+            let mut strain = p.affine_momentum;
+            let trace = strain.y_axis.x + strain.x_axis.y;
+            strain.y_axis.x = trace;
+            strain.x_axis.y = trace;
+
+            let viscosity_term = dynamic_viscosity * strain;
+            let stress = -pressure * Mat2::IDENTITY + viscosity_term;
+            let eg_16_term_0 = -4.0 * volume * stress * dt;
+
+            for gy in 0..3 {
+                for gx in 0..3 {
+                    let weight = w[gx as usize].x * w[gy as usize].y;
+                    let cell_pos = cell_idx + IVec2::new(gx - 1, gy - 1);
+                    let cell_dist = cell_pos.as_vec2() - p.pos + Vec2::splat(0.5);
+
+                    let grid_idx = (cell_pos.y * grid_res + cell_pos.x) as usize;
+                    let cell = &mut self.grid[grid_idx];
+                    cell.vel += weight * eg_16_term_0 * cell_dist;
+                }
+            }
+        }
+    }
+
+    fn update_grid(&mut self) {
+        let grid_res = self.config.grid_res;
+        let dt = self.config.dt;
+        let gravity = self.config.gravity;
+
+        let boundary = self.config.boundary_clip.ceil() as i32;
+
+        for i in 0..grid_res * grid_res {
+            let cell = &mut self.grid[i as usize];
+
+            if cell.mass > 0.0 {
+                cell.vel /= cell.mass;
+                cell.vel += dt * gravity;
+
+                let x = i % grid_res;
+                if x < boundary || x > grid_res - 1 - boundary {
+                    cell.vel.x = 0.0;
+                }
+
+                let y = i / grid_res;
+                if y < boundary || y > grid_res - 1 - boundary {
+                    cell.vel.y = 0.0;
+                }
+            }
+        }
+    }
+
+    fn g2p(&mut self, mouse_pos: &Option<Vec2>) {
+        let grid_res = self.config.grid_res;
+        let dt = self.config.dt;
+        let mouse_radius = self.config.mouse_radius;
+        let boundary_clip = self.config.boundary_clip;
+        let boundary_damp = self.config.boundary_damp;
+
+        for p in self.particles.iter_mut() {
+            p.vel = Vec2::ZERO;
+
+            let cell_idx = p.pos.floor().as_ivec2();
+            let cell_diff = p.pos - cell_idx.as_vec2() - Vec2::splat(0.5);
+            let w = Self::quadratic_weights(cell_diff);
+
+            let mut b_mat = Mat2::ZERO;
+            for gx in 0..3 {
+                for gy in 0..3 {
+                    let weight = w[gx as usize].x * w[gy as usize].y;
+
+                    let cell_pos = cell_idx + IVec2::new(gx - 1, gy - 1);
+                    let cell_dist = cell_pos.as_vec2() - p.pos + Vec2::splat(0.5);
+
+                    let grid_idx = (cell_pos.y * grid_res + cell_pos.x) as usize;
+                    let weighted_velocity = self.grid[grid_idx].vel * weight;
+
+                    let term = Mat2::from_cols(
+                        weighted_velocity * cell_dist.x,
+                        weighted_velocity * cell_dist.y,
+                    );
+                    b_mat += term;
+                    p.vel += weighted_velocity;
+                }
+            }
+
+            p.affine_momentum = 4.0 * b_mat;
+            p.pos += p.vel * dt;
+
+            // mouse interaction
+
+            if let Some(mouse) = mouse_pos {
+                let dist = p.pos - mouse;
+                if dist.length_squared() < mouse_radius.powi(2) {
+                    p.vel += dist.normalize_or_zero();
+                }
+            }
+
+            // boundary conditions
+
+            p.pos = Vec2::clamp(
+                p.pos,
+                Vec2::splat(self.config.boundary_clip),
+                IVec2::splat(grid_res - 1).as_vec2() - Vec2::splat(boundary_clip),
+            );
+
+            let next_pos = p.pos + p.vel;
+            let wall_min = self.config.boundary_damp;
+            let wall_max = (grid_res - 1) as f32 - boundary_damp;
+
+            if next_pos.x < wall_min {
+                p.vel.x += wall_min - next_pos.x;
+            }
+            if next_pos.x > wall_max {
+                p.vel.x += wall_max - next_pos.x;
+            }
+            if next_pos.y < wall_min {
+                p.vel.y += wall_min - next_pos.y;
+            }
+            if next_pos.y > wall_max {
+                p.vel.y += wall_max - next_pos.y;
+            }
+        }
+    }
+
+    fn quadratic_weights(cell_diff: Vec2) -> [Vec2; 3] {
+        [
+            0.5 * (0.5 - cell_diff).powf(2.0),
+            0.75 - cell_diff.powf(2.0),
+            0.5 * (0.5 + cell_diff).powf(2.0),
+        ]
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Event {
     Quit,
     Drag(u16, u16),
-    Resize(u16, u16),
 }
 
-fn input_handle(tx: crossbeam_channel::Sender<Event>) {
-    loop {
-        match crossterm::event::read() {
-            Ok(event) => match event {
-                crossterm::event::Event::Key(key_event) => {
-                    if key_event.code == crossterm::event::KeyCode::Char('q') {
-                        let _ = tx.send(Event::Quit);
-                    }
-                }
-                crossterm::event::Event::Mouse(mouse_event) => {
-                    if matches!(mouse_event.kind, crossterm::event::MouseEventKind::Down(_)) {
-                        let _ = tx.try_send(Event::Drag(mouse_event.column, mouse_event.row));
-                    }
-                    if matches!(mouse_event.kind, crossterm::event::MouseEventKind::Drag(_)) {
-                        let _ = tx.try_send(Event::Drag(mouse_event.column, mouse_event.row));
-                    }
-                }
-                crossterm::event::Event::Resize(x, y) => {
-                    let _ = tx.send(Event::Resize(x, y));
-                }
-                _ => {}
-            },
-            Err(_) => {}
-        }
-    }
-}
+fn setup_terminal(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    use crossterm::{cursor, event, terminal, ExecutableCommand};
 
-// console output
-
-fn draw_base<T: Write + ?Sized>(out: &mut T) -> std::io::Result<()> {
-    out.execute(crossterm::terminal::Clear(
-        crossterm::terminal::ClearType::All,
-    ))?;
-
-    let msg = "2D MLS-MPM Fluid Simulation -- [Drag mouse] Interact, [q] Quit.";
-    out.execute(crossterm::cursor::MoveTo(0, STDOUT_SIZE.y as u16))?
-        .execute(crossterm::style::Print(msg.dark_green().bold()))?;
-
+    terminal::enable_raw_mode()?;
+    out.execute(terminal::EnterAlternateScreen)?;
+    out.execute(cursor::Hide)?;
+    out.execute(event::EnableMouseCapture)?;
     Ok(())
 }
 
-fn draw<T: Write + ?Sized>(particles: &[Particle], out: &mut T) -> std::io::Result<()> {
-    let mut bin_counts = [0; (STDOUT_SIZE.x * STDOUT_SIZE.y) as usize];
+fn restore_terminal(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    use crossterm::{cursor, event, terminal, ExecutableCommand};
 
-    for i in 0..PARTICLE_SIZE {
-        let xyz = (particles[i as usize].x / Vec2::splat(GRID_RES as f32) * STDOUT_SIZE.as_vec2())
-            .as_ivec2();
+    out.execute(event::DisableMouseCapture)?;
+    out.execute(cursor::Show)?;
+    out.execute(terminal::LeaveAlternateScreen)?;
+    terminal::disable_raw_mode()?;
+    Ok(())
+}
 
-        if xyz.cmpge(IVec2::ZERO).all() && xyz.cmplt(STDOUT_SIZE).all() {
-            bin_counts[(xyz.y * STDOUT_SIZE.x + xyz.x) as usize] += 1;
+fn event_handler(tx: crossbeam_channel::Sender<Event>) {
+    use crossterm::event;
+
+    loop {
+        if let Ok(event) = event::read() {
+            match event {
+                event::Event::Key(key_event) => {
+                    if key_event.code == event::KeyCode::Char('q') {
+                        let _ = tx.send(Event::Quit);
+                    }
+                }
+                event::Event::Mouse(mouse_event) => {
+                    if matches!(mouse_event.kind, event::MouseEventKind::Down(_)) {
+                        let _ = tx.try_send(Event::Drag(mouse_event.column, mouse_event.row));
+                    }
+                    if matches!(mouse_event.kind, event::MouseEventKind::Drag(_)) {
+                        let _ = tx.try_send(Event::Drag(mouse_event.column, mouse_event.row));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn draw(out: &mut impl std::io::Write, sim: &Simulation) -> std::io::Result<()> {
+    use crossterm::ExecutableCommand;
+
+    let grid_res = sim.config.grid_res as f32;
+    let console_size = sim.config.console_size;
+
+    let bin_count_size = console_size.x * console_size.y;
+    let mut bin_counts = vec![0; bin_count_size as usize];
+
+    for p in sim.particles.iter() {
+        let screen_pos = (p.pos / Vec2::splat(grid_res) * console_size.as_vec2()).as_ivec2();
+        if screen_pos.cmpge(IVec2::ZERO).all() && screen_pos.cmplt(console_size).all() {
+            let idx = screen_pos.y * console_size.x + screen_pos.x;
+            bin_counts[idx as usize] += 1;
         }
     }
 
-    for y in 0..STDOUT_SIZE.y {
+    for y in 0..console_size.y {
         out.execute(crossterm::cursor::MoveTo(0, y as u16))?;
-        for x in 0..STDOUT_SIZE.x {
-            let ch = match bin_counts[(y * STDOUT_SIZE.x + x) as usize] {
+        for x in 0..console_size.x {
+            let idx = y * console_size.x + x;
+            let bin_count = bin_counts[idx as usize];
+            let ch = match bin_count {
                 n if n < 1 => b' ',
                 n if n < 2 => b'.',
                 n if n < 3 => b'-',
@@ -299,83 +375,49 @@ fn draw<T: Write + ?Sized>(particles: &[Particle], out: &mut T) -> std::io::Resu
             out.write_all(&[ch])?;
         }
     }
+
     Ok(())
 }
 
-// main routine
-
 fn main() -> std::io::Result<()> {
-    let mut rng = rand::rng();
-
-    let time = std::time::Duration::from_secs_f32(DT);
-
-    let mut particles = [Particle::default(); PARTICLE_SIZE as usize];
-    let mut grid = [Cell::default(); (GRID_RES * GRID_RES) as usize];
-
-    for i in 0..PARTICLE_SIZE {
-        let x = rng.random_range(16.0..=48.0);
-        let y = rng.random_range(16.0..=48.0);
-        particles[i as usize].x = Vec2::new(x, y);
-        particles[i as usize].v = Vec2::ZERO;
-        particles[i as usize].c_mat = Mat2::ZERO;
-        particles[i as usize].m = 1.0;
-    }
-
-    for i in 0..GRID_RES * GRID_RES {
-        grid[i as usize].v = Vec2::ZERO;
-        grid[i as usize].m = 0.0;
-    }
-
     let mut out = std::io::BufWriter::new(std::io::stdout());
-
-    crossterm::terminal::enable_raw_mode()?;
-    out.execute(crossterm::terminal::EnterAlternateScreen)?;
-    out.execute(crossterm::cursor::Hide)?;
-    out.execute(crossterm::event::EnableMouseCapture)?;
-
-    draw_base(&mut out)?;
+    setup_terminal(&mut out)?;
 
     let (tx, rx) = crossbeam_channel::bounded::<Event>(1);
-    std::thread::spawn(|| input_handle(tx));
+    std::thread::spawn(|| event_handler(tx));
+
+    let config = Config::default();
+    let mut sim = Simulation::new(config);
+
+    sim.initialize_particles();
+
+    let console_size = sim.config.console_size;
+    let grid_res = sim.config.grid_res;
+    let time = std::time::Duration::from_secs_f32(sim.config.dt);
     loop {
-        let mut enforce = None;
+        let mut mouse_pos = None;
 
         match rx.try_recv() {
             Ok(event) => match event {
                 Event::Quit => break,
                 Event::Drag(x, y) => {
-                    let x = x as f32 / STDOUT_SIZE.x as f32 * GRID_RES as f32;
-                    let y = y as f32 / STDOUT_SIZE.y as f32 * GRID_RES as f32;
-                    enforce = Some(Vec2::new(x, y));
-                }
-                Event::Resize(width, height) => {
-                    if width < STDOUT_SIZE.x as u16 || height < STDOUT_SIZE.y as u16 {
-                        break;
-                    }
-                    draw_base(&mut out)?;
+                    let x = x as f32 / console_size.x as f32 * grid_res as f32;
+                    let y = y as f32 / console_size.y as f32 * grid_res as f32;
+                    mouse_pos = Some(Vec2::new(x, y));
                 }
             },
             Err(crossbeam_channel::TryRecvError::Empty) => {}
             Err(crossbeam_channel::TryRecvError::Disconnected) => break,
         }
 
-        draw(&particles, &mut out)?;
+        draw(&mut out, &sim)?;
 
-        for _ in 0..ITERATIONS {
-            clear_grid(&mut grid);
-            p2g_1(&particles, &mut grid);
-            p2g_2(&particles, &mut grid);
-            update_grid(&mut grid);
-            g2p(&mut particles, &grid, &enforce);
-        }
+        sim.step(&mouse_pos);
 
         std::thread::sleep(time);
     }
 
-    out.execute(crossterm::event::DisableMouseCapture)?;
-    out.execute(crossterm::cursor::Show)?;
-    out.execute(crossterm::terminal::LeaveAlternateScreen)?;
-    crossterm::terminal::disable_raw_mode()?;
+    restore_terminal(&mut out)?;
 
     Ok(())
 }
