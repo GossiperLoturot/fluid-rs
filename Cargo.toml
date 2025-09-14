@@ -8,10 +8,15 @@ name = "2d"
 path = "src/2d.rs"
 
 [[bin]]
+name = "2d_mul"
+path = "src/2d_mul.rs"
+
+[[bin]]
 name = "3d"
 path = "src/3d.rs"
 
 [dependencies]
+ahash = "0.8"
 crossbeam-channel = "0.5"
 crossterm = "0.29"
 glam = "0.30"
