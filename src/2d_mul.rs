@@ -54,6 +54,7 @@ struct Cell {
 
 struct Simulation {
     config: Config,
+    passive_mul: Vec<IVec2>,
     active_mul: Vec<IVec2>,
     particles_mul: ahash::AHashMap<IVec2, Vec<Particle>>,
     grid_mul: ahash::AHashMap<IVec2, Vec<Cell>>,
@@ -63,6 +64,7 @@ impl Simulation {
     fn new(config: Config) -> Self {
         Self {
             config,
+            passive_mul: Vec::new(),
             active_mul: Vec::new(),
             particles_mul: ahash::AHashMap::new(),
             grid_mul: ahash::AHashMap::new(),
@@ -74,10 +76,12 @@ impl Simulation {
 
         let mut rng = rand::rng();
 
-        self.active_mul.push(IVec2::new(0, 0));
-        self.active_mul.push(IVec2::new(1, 0));
-        self.active_mul.push(IVec2::new(0, 1));
-        self.active_mul.push(IVec2::new(1, 1));
+        for y in -1..=2 {
+            for x in -1..=2 {
+                self.passive_mul.push(IVec2::new(x, y));
+                self.active_mul.push(IVec2::new(x, y));
+            }
+        }
 
         for _ in 0..4096 {
             let x = rng.random_range(16.0..=48.0);
@@ -110,7 +114,12 @@ impl Simulation {
     }
 
     fn clear_grid(&mut self) {
-        for (_, grid) in self.grid_mul.iter_mut() {
+        for key in self.passive_mul.iter() {
+            if !self.grid_mul.contains_key(key) {
+                continue;
+            }
+            let grid = self.grid_mul.get_mut(key).unwrap();
+
             for cell in grid.iter_mut() {
                 cell.vel = Vec2::ZERO;
                 cell.mass = 0.0;
@@ -121,7 +130,12 @@ impl Simulation {
     fn p2g_1(&mut self) {
         let grid_res = self.config.grid_res;
 
-        for (_, particles) in self.particles_mul.iter() {
+        for key in self.passive_mul.iter() {
+            if !self.particles_mul.contains_key(key) {
+                continue;
+            }
+            let particles = self.particles_mul.get(key).unwrap();
+
             for p in particles.iter() {
                 let cell_idx = p.pos.floor().as_ivec2();
                 let cell_diff = p.pos - cell_idx.as_vec2() - Vec2::splat(0.5);
@@ -162,7 +176,12 @@ impl Simulation {
         let dynamic_viscosity = self.config.dynamic_viscosity;
         let dt = self.config.dt;
 
-        for (_, particles) in self.particles_mul.iter() {
+        for key in self.passive_mul.iter() {
+            if !self.particles_mul.contains_key(key) {
+                continue;
+            }
+            let particles = self.particles_mul.get(key).unwrap();
+
             for p in particles.iter() {
                 let cell_idx = p.pos.floor().as_ivec2();
                 let cell_diff = p.pos - cell_idx.as_vec2() - Vec2::splat(0.5);
@@ -229,7 +248,12 @@ impl Simulation {
         let dt = self.config.dt;
         let gravity = self.config.gravity;
 
-        for (_, grid) in self.grid_mul.iter_mut() {
+        for key in self.passive_mul.iter() {
+            if !self.grid_mul.contains_key(key) {
+                continue;
+            }
+            let grid = self.grid_mul.get_mut(key).unwrap();
+
             for i in 0..grid_res * grid_res {
                 let cell = &mut grid[i as usize];
 
@@ -250,7 +274,12 @@ impl Simulation {
 
         let mut move_buf = vec![];
 
-        for (key, particles) in self.particles_mul.iter_mut() {
+        for key in self.active_mul.iter() {
+            if !self.particles_mul.contains_key(key) {
+                continue;
+            }
+            let particles = self.particles_mul.get_mut(key).unwrap();
+
             for (i, p) in particles.iter_mut().enumerate() {
                 p.vel = Vec2::ZERO;
 
@@ -319,7 +348,7 @@ impl Simulation {
                     p.vel.y += wall_max.y - next_pos.y;
                 }
 
-                let to_key = p.pos.rem_euclid(Vec2::splat(MUL_SIZE as f32)).as_ivec2();
+                let to_key = p.pos.div_euclid(Vec2::splat(MUL_SIZE as f32)).as_ivec2();
                 if to_key != *key {
                     move_buf.push((*key, i, to_key));
                 }
