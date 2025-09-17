@@ -12,8 +12,6 @@ struct Config {
     mouse_radius: f32,
     boundary_clip: Vec4,
     boundary_damp_dist: f32,
-    viewport_size: Vec2,
-    console_size: IVec2,
 }
 
 impl Default for Config {
@@ -30,8 +28,6 @@ impl Default for Config {
             mouse_radius: 10.0,
             boundary_clip: Vec4::new(0.0, 0.0, 64.0, 64.0),
             boundary_damp_dist: 3.0,
-            viewport_size: Vec2::new(64.0, 64.0),
-            console_size: IVec2::new(80, 40),
         }
     }
 }
@@ -56,6 +52,7 @@ struct Simulation {
     active_mul: Vec<IVec2>,
     particles_mul: ahash::AHashMap<IVec2, Vec<Particle>>,
     grid_mul: ahash::AHashMap<IVec2, Vec<Cell>>,
+    debug_elapseds: Vec<(&'static str, std::time::Duration)>,
 }
 
 impl Simulation {
@@ -66,6 +63,7 @@ impl Simulation {
             active_mul: Vec::new(),
             particles_mul: ahash::AHashMap::new(),
             grid_mul: ahash::AHashMap::new(),
+            debug_elapseds: Vec::new(),
         }
     }
 
@@ -99,11 +97,27 @@ impl Simulation {
 
     pub fn step(&mut self, mouse_pos: &Option<Vec2>) {
         for _ in 0..self.config.iterations {
+            self.debug_elapseds.clear();
+
+            let instance = std::time::Instant::now();
             self.clear_grid();
+            self.debug_elapseds.push(("clear", instance.elapsed()));
+
+            let instance = std::time::Instant::now();
             self.p2g_1();
+            self.debug_elapseds.push(("p2g 1", instance.elapsed()));
+
+            let instance = std::time::Instant::now();
             self.p2g_2();
+            self.debug_elapseds.push(("p2g 2", instance.elapsed()));
+
+            let instance = std::time::Instant::now();
             self.update_grid();
+            self.debug_elapseds.push(("update", instance.elapsed()));
+
+            let instance = std::time::Instant::now();
             self.g2p(mouse_pos);
+            self.debug_elapseds.push(("g2p", instance.elapsed()));
         }
     }
 
@@ -399,11 +413,13 @@ fn event_handler(tx: crossbeam_channel::Sender<Event>) {
     }
 }
 
-fn draw(out: &mut impl std::io::Write, sim: &Simulation) -> std::io::Result<()> {
+fn draw(
+    out: &mut impl std::io::Write,
+    sim: &Simulation,
+    viewport_size: Vec2,
+    console_size: IVec2,
+) -> std::io::Result<()> {
     use crossterm::ExecutableCommand;
-
-    let viewport_size = sim.config.viewport_size;
-    let console_size = sim.config.console_size;
 
     let bin_count_size = console_size.x * console_size.y;
     let mut bin_counts = vec![0; bin_count_size as usize];
@@ -438,6 +454,15 @@ fn draw(out: &mut impl std::io::Write, sim: &Simulation) -> std::io::Result<()> 
         }
     }
 
+    for (i, (label, elapsed)) in sim.debug_elapseds.iter().enumerate() {
+        let y = (console_size.y + i as i32) as u16;
+        out.execute(crossterm::cursor::MoveTo(0, y))?;
+        write!(out, "{}: {:?}", label, elapsed)?;
+        out.execute(crossterm::terminal::Clear(
+            crossterm::terminal::ClearType::FromCursorDown,
+        ))?;
+    }
+
     Ok(())
 }
 
@@ -465,8 +490,8 @@ fn main() -> std::io::Result<()> {
     }
     sim.set_update_rect(Vec2::new(0.0, 0.0), Vec2::new(64.0, 64.0));
 
-    let viewport_size = sim.config.viewport_size;
-    let console_size = sim.config.console_size;
+    let viewport_size = Vec2::new(64.0, 64.0);
+    let console_size = IVec2::new(80, 40);
     let time = std::time::Duration::from_secs_f32(sim.config.dt);
     loop {
         let mut mouse_pos = None;
@@ -484,7 +509,7 @@ fn main() -> std::io::Result<()> {
             Err(crossbeam_channel::TryRecvError::Disconnected) => break,
         }
 
-        draw(&mut out, &sim)?;
+        draw(&mut out, &sim, viewport_size, console_size)?;
 
         sim.step(&mouse_pos);
 
