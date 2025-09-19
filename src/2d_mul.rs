@@ -48,10 +48,14 @@ struct Cell {
 
 struct Simulation {
     config: Config,
-    passive_mul: Vec<IVec2>,
-    active_mul: Vec<IVec2>,
-    particles_mul: ahash::AHashMap<IVec2, Vec<Particle>>,
-    grid_mul: ahash::AHashMap<IVec2, Vec<Cell>>,
+    spatial_idx: ahash::AHashMap<IVec2, usize>,
+    spatial_idx_rev: Vec<IVec2>,
+    precompute_mul: Vec<usize>,
+    passive_mul: Vec<usize>,
+    active_mul: Vec<usize>,
+    particles_mul: Vec<Vec<Particle>>,
+    grid_mul: Vec<Vec<Cell>>,
+    neighbors_mul: Vec<Vec<usize>>,
     debug_elapseds: Vec<(&'static str, std::time::Duration)>,
 }
 
@@ -59,39 +63,96 @@ impl Simulation {
     pub fn new(config: Config) -> Self {
         Self {
             config,
+            spatial_idx: ahash::AHashMap::new(),
+            spatial_idx_rev: Vec::new(),
+            precompute_mul: Vec::new(),
             passive_mul: Vec::new(),
             active_mul: Vec::new(),
-            particles_mul: ahash::AHashMap::new(),
-            grid_mul: ahash::AHashMap::new(),
+            particles_mul: Vec::new(),
+            grid_mul: Vec::new(),
+            neighbors_mul: Vec::new(),
             debug_elapseds: Vec::new(),
         }
     }
 
     pub fn set_update_rect(&mut self, min: Vec2, max: Vec2) {
-        // active
-        self.active_mul.clear();
-        let min_key = get_key(min, &self.config);
-        let max_key = get_key(max, &self.config);
+        // pre-compute
+        for id in self.precompute_mul.drain(..) {
+            free_space(
+                &self.spatial_idx,
+                &self.spatial_idx_rev,
+                &mut self.particles_mul,
+                &mut self.grid_mul,
+                &mut self.neighbors_mul,
+                id,
+            );
+        }
+        let min_key = key_from_pos(min, &self.config) - IVec2::ONE;
+        let max_key = key_from_pos(max, &self.config) + IVec2::ONE;
         for y in min_key.y..=max_key.y {
             for x in min_key.x..=max_key.x {
-                self.active_mul.push(IVec2::new(x, y));
+                init_space(
+                    &mut self.spatial_idx,
+                    &mut self.spatial_idx_rev,
+                    &mut self.particles_mul,
+                    &mut self.grid_mul,
+                    &mut self.neighbors_mul,
+                    &IVec2::new(x, y),
+                );
+
+                let id = self.spatial_idx.get(&IVec2::new(x, y)).unwrap();
+                self.precompute_mul.push(*id);
             }
+        }
+        for id in self.precompute_mul.iter() {
+            bake_space(
+                &self.spatial_idx,
+                &self.spatial_idx_rev,
+                &mut self.particles_mul,
+                &mut self.grid_mul,
+                &mut self.neighbors_mul,
+                &self.config,
+                *id,
+            );
         }
 
         // passive
         self.passive_mul.clear();
-        let min_key = get_key(min, &self.config) - IVec2::ONE;
-        let max_key = get_key(max, &self.config) + IVec2::ONE;
+        let min_key = key_from_pos(min, &self.config) - IVec2::ONE;
+        let max_key = key_from_pos(max, &self.config) + IVec2::ONE;
         for y in min_key.y..=max_key.y {
             for x in min_key.x..=max_key.x {
-                self.passive_mul.push(IVec2::new(x, y));
+                let id = self.spatial_idx.get(&IVec2::new(x, y)).unwrap();
+                self.passive_mul.push(*id);
+            }
+        }
+
+        // active
+        self.active_mul.clear();
+        let min_key = key_from_pos(min, &self.config);
+        let max_key = key_from_pos(max, &self.config);
+        for y in min_key.y..=max_key.y {
+            for x in min_key.x..=max_key.x {
+                let id = self.spatial_idx.get(&IVec2::new(x, y)).unwrap();
+                self.active_mul.push(*id);
             }
         }
     }
 
     pub fn add_particle(&mut self, p: Particle) {
-        let key = get_key(p.pos, &self.config);
-        let particles = get_mut_particles(&mut self.particles_mul, key);
+        let key = key_from_pos(p.pos, &self.config);
+
+        init_space(
+            &mut self.spatial_idx,
+            &mut self.spatial_idx_rev,
+            &mut self.particles_mul,
+            &mut self.grid_mul,
+            &mut self.neighbors_mul,
+            &key,
+        );
+
+        let id = self.spatial_idx.get(&key).unwrap();
+        let particles = self.particles_mul.get_mut(*id).unwrap();
         particles.push(p);
     }
 
@@ -122,8 +183,8 @@ impl Simulation {
     }
 
     fn clear_grid(&mut self) {
-        for key in self.passive_mul.iter() {
-            let grid = get_mut_grid(&mut self.grid_mul, *key, &self.config);
+        for id in self.passive_mul.iter() {
+            let grid = self.grid_mul.get_mut(*id).unwrap();
 
             for cell in grid.iter_mut() {
                 cell.vel = Vec2::ZERO;
@@ -133,9 +194,8 @@ impl Simulation {
     }
 
     fn p2g_1(&mut self) {
-        for key in self.passive_mul.iter() {
-            // immutable annotate
-            let particles: &_ = get_mut_particles(&mut self.particles_mul, *key);
+        for id in self.passive_mul.iter() {
+            let particles = self.particles_mul.get(*id).unwrap();
 
             for p in particles.iter() {
                 let cell_pos = p.pos.floor().as_ivec2();
@@ -151,9 +211,18 @@ impl Simulation {
                         let q = p.affine_momentum * -cell_diff_n;
                         let mass_contrib = weight * p.mass;
 
-                        let cell_n = get_mut_cell(&mut self.grid_mul, cell_pos_n, &self.config);
-                        cell_n.mass += mass_contrib;
-                        cell_n.vel += mass_contrib * (p.vel + q);
+                        if let Some(cell_n) = cell_mut_from_pos(
+                            &self.spatial_idx,
+                            &self.spatial_idx_rev,
+                            &mut self.grid_mul,
+                            &self.neighbors_mul,
+                            &self.config,
+                            *id,
+                            &cell_pos_n,
+                        ) {
+                            cell_n.mass += mass_contrib;
+                            cell_n.vel += mass_contrib * (p.vel + q);
+                        }
                     }
                 }
             }
@@ -167,9 +236,8 @@ impl Simulation {
         let dynamic_viscosity = self.config.dynamic_viscosity;
         let dt = self.config.dt;
 
-        for key in self.passive_mul.iter() {
-            // immutable annotate
-            let particles: &_ = get_mut_particles(&mut self.particles_mul, *key);
+        for id in self.passive_mul.iter() {
+            let particles = self.particles_mul.get(*id).unwrap();
 
             for p in particles.iter() {
                 let cell_pos = p.pos.floor().as_ivec2();
@@ -182,9 +250,17 @@ impl Simulation {
                         let cell_pos_n = cell_pos + IVec2::new(nx - 1, ny - 1);
                         let weight = weights[nx as usize].x * weights[ny as usize].y;
 
-                        // immutable annotate
-                        let cell_n: &_ = get_mut_cell(&mut self.grid_mul, cell_pos_n, &self.config);
-                        density += cell_n.mass * weight;
+                        if let Some(cell_n) = cell_mut_from_pos(
+                            &self.spatial_idx,
+                            &self.spatial_idx_rev,
+                            &mut self.grid_mul,
+                            &self.neighbors_mul,
+                            &self.config,
+                            *id,
+                            &cell_pos_n,
+                        ) {
+                            density += cell_n.mass * weight;
+                        }
                     }
                 }
                 let volume = p.mass / density;
@@ -208,8 +284,17 @@ impl Simulation {
                         let cell_diff_n = p.pos - (cell_pos_n.as_vec2() + Vec2::splat(0.5));
                         let weight = weights[nx as usize].x * weights[ny as usize].y;
 
-                        let cell_n = get_mut_cell(&mut self.grid_mul, cell_pos_n, &self.config);
-                        cell_n.vel += weight * eg_16_term_0 * -cell_diff_n;
+                        if let Some(cell_n) = cell_mut_from_pos(
+                            &self.spatial_idx,
+                            &self.spatial_idx_rev,
+                            &mut self.grid_mul,
+                            &self.neighbors_mul,
+                            &self.config,
+                            *id,
+                            &cell_pos_n,
+                        ) {
+                            cell_n.vel += weight * eg_16_term_0 * -cell_diff_n;
+                        }
                     }
                 }
             }
@@ -220,8 +305,8 @@ impl Simulation {
         let dt = self.config.dt;
         let gravity = self.config.gravity;
 
-        for key in self.passive_mul.iter() {
-            let grid = get_mut_grid(&mut self.grid_mul, *key, &self.config);
+        for id in self.passive_mul.iter() {
+            let grid = self.grid_mul.get_mut(*id).unwrap();
 
             for cell in grid.iter_mut() {
                 if cell.mass > 0.0 {
@@ -239,8 +324,8 @@ impl Simulation {
         let boundary_damp_dist = self.config.boundary_damp_dist;
 
         let mut move_buf = vec![];
-        for key in self.active_mul.iter() {
-            let particles = get_mut_particles(&mut self.particles_mul, *key);
+        for id in self.active_mul.iter() {
+            let particles = self.particles_mul.get_mut(*id).unwrap();
 
             for mut p in particles.drain(..) {
                 p.vel = Vec2::ZERO;
@@ -256,16 +341,24 @@ impl Simulation {
                         let cell_diff_n = p.pos - (cell_pos_n.as_vec2() + Vec2::splat(0.5));
                         let weight = weights[nx as usize].x * weights[ny as usize].y;
 
-                        // immutable annotate
-                        let cell_n: &_ = get_mut_cell(&mut self.grid_mul, cell_pos_n, &self.config);
-                        let weighted_velocity = cell_n.vel * weight;
+                        if let Some(cell_n) = cell_mut_from_pos(
+                            &self.spatial_idx,
+                            &self.spatial_idx_rev,
+                            &mut self.grid_mul,
+                            &self.neighbors_mul,
+                            &self.config,
+                            *id,
+                            &cell_pos_n,
+                        ) {
+                            let weighted_velocity = cell_n.vel * weight;
 
-                        let term = Mat2::from_cols(
-                            weighted_velocity * -cell_diff_n.x,
-                            weighted_velocity * -cell_diff_n.y,
-                        );
-                        b_mat += term;
-                        p.vel += weighted_velocity;
+                            let term = Mat2::from_cols(
+                                weighted_velocity * -cell_diff_n.x,
+                                weighted_velocity * -cell_diff_n.y,
+                            );
+                            b_mat += term;
+                            p.vel += weighted_velocity;
+                        }
                     }
                 }
 
@@ -302,13 +395,13 @@ impl Simulation {
                     p.vel.y += wall_max.y - next_pos.y;
                 }
 
-                let key_to = get_key(p.pos, &self.config);
-                move_buf.push((key_to, p));
+                let new_id = 0; // TODO
+                move_buf.push((new_id, p));
             }
         }
 
-        for (key, p) in move_buf.into_iter() {
-            let particles = get_mut_particles(&mut self.particles_mul, key);
+        for (id, p) in move_buf.into_iter() {
+            let particles = self.particles_mul.get_mut(id).unwrap();
             particles.push(p);
         }
     }
@@ -316,7 +409,7 @@ impl Simulation {
     pub fn iter_particle(&self) -> impl Iterator<Item = &Particle> + '_ {
         self.active_mul
             .iter()
-            .filter_map(|key| self.particles_mul.get(key))
+            .filter_map(|id| self.particles_mul.get(*id))
             .flatten()
     }
 }
@@ -329,37 +422,100 @@ fn quadratic_weights(cell_diff: Vec2) -> [Vec2; 3] {
     ]
 }
 
-fn get_key(pos: Vec2, config: &Config) -> IVec2 {
+fn key_from_pos(pos: Vec2, config: &Config) -> IVec2 {
     pos.div_euclid(Vec2::splat(config.grid_res as f32))
         .as_ivec2()
 }
 
-fn get_mut_particles(
-    particles_mul: &mut ahash::AHashMap<IVec2, Vec<Particle>>,
-    key: IVec2,
-) -> &mut Vec<Particle> {
-    particles_mul.entry(key).or_default()
+fn init_space(
+    spatial_idx: &mut ahash::AHashMap<IVec2, usize>,
+    spatial_idx_rev: &mut Vec<IVec2>,
+    particles_mul: &mut Vec<Vec<Particle>>,
+    grid_mul: &mut Vec<Vec<Cell>>,
+    neighbors_mul: &mut Vec<Vec<usize>>,
+    key: &IVec2,
+) {
+    if !spatial_idx.contains_key(&key) {
+        let id = spatial_idx_rev.len();
+
+        spatial_idx_rev.push(*key);
+        particles_mul.push(Default::default());
+        grid_mul.push(Default::default());
+        neighbors_mul.push(Default::default());
+
+        spatial_idx.insert(*key, id);
+    }
 }
 
-fn get_mut_grid<'a>(
-    grid_mul: &'a mut ahash::AHashMap<IVec2, Vec<Cell>>,
-    key: IVec2,
-    config: &'a Config,
-) -> &'a mut Vec<Cell> {
-    let init_f = || vec![Cell::default(); (config.grid_res * config.grid_res) as usize];
-    grid_mul.entry(key).or_insert_with(init_f)
+fn bake_space(
+    spatial_idx: &ahash::AHashMap<IVec2, usize>,
+    spatial_idx_rev: &Vec<IVec2>,
+    _particles_mul: &mut Vec<Vec<Particle>>,
+    grid_mul: &mut Vec<Vec<Cell>>,
+    neighbors_mul: &mut Vec<Vec<usize>>,
+    config: &Config,
+    id: usize,
+) {
+    // for grid
+    let grid = grid_mul.get_mut(id).unwrap();
+    *grid = vec![Default::default(); (config.grid_res * config.grid_res) as usize];
+
+    // for neighbors
+    let key = spatial_idx_rev.get(id).unwrap();
+    let neighbors = neighbors_mul.get_mut(id).unwrap();
+    *neighbors = vec![Default::default(); 9];
+    for ny in 0..3 {
+        for nx in 0..3 {
+            let key = key + IVec2::new(nx as i32 - 1, ny as i32 - 1);
+            let neighbor_id = 3 * ny + nx;
+            neighbors[neighbor_id] = *spatial_idx.get(&key).unwrap_or(&usize::MAX);
+        }
+    }
 }
 
-fn get_mut_cell<'a>(
-    grid_mul: &'a mut ahash::AHashMap<IVec2, Vec<Cell>>,
-    cell_pos: IVec2,
-    config: &'a Config,
-) -> &'a mut Cell {
-    let key = cell_pos.div_euclid(IVec2::splat(config.grid_res));
-    let grid = get_mut_grid(grid_mul, key, config);
-    let index_xy = cell_pos - key * config.grid_res;
-    let index = index_xy.x + config.grid_res * index_xy.y;
-    grid.get_mut(index as usize).unwrap()
+fn free_space(
+    _spatial_idx: &ahash::AHashMap<IVec2, usize>,
+    _spatial_idx_rev: &Vec<IVec2>,
+    _particles_mul: &mut Vec<Vec<Particle>>,
+    grid_mul: &mut Vec<Vec<Cell>>,
+    neighbors_mul: &mut Vec<Vec<usize>>,
+    id: usize,
+) {
+    // for grid
+    let grid = grid_mul.get_mut(id).unwrap();
+    *grid = vec![];
+
+    // for neighbors
+    let neighbors = neighbors_mul.get_mut(id).unwrap();
+    *neighbors = vec![];
+}
+
+fn cell_mut_from_pos<'a>(
+    _spatial_idx: &'a ahash::AHashMap<IVec2, usize>,
+    spatial_idx_rev: &'a Vec<IVec2>,
+    grid_mul: &'a mut Vec<Vec<Cell>>,
+    neighbors_mul: &'a Vec<Vec<usize>>,
+    config: &Config,
+    id: usize,
+    pos: &'a IVec2,
+) -> Option<&'a mut Cell> {
+    let neighbors = neighbors_mul.get(id).unwrap();
+
+    let key = spatial_idx_rev.get(id).unwrap();
+    let new_key = pos.div_euclid(IVec2::splat(config.grid_res));
+    let nxy = new_key - key;
+    if nxy.cmplt(IVec2::NEG_ONE).any() || nxy.cmpgt(IVec2::ONE).any() {
+        return None;
+    }
+
+    let neighbor_id = 3 * (nxy.y + 1) + nxy.x + 1;
+    let id = neighbors.get(neighbor_id as usize)?;
+
+    let grid = grid_mul.get_mut(*id).unwrap();
+    let ixy = pos - key * config.grid_res;
+    let index = config.grid_res * ixy.y + ixy.x;
+    let cell = grid.get_mut(index as usize).unwrap();
+    Some(cell)
 }
 
 #[derive(Clone, Copy)]
