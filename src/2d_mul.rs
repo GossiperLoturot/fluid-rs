@@ -48,14 +48,13 @@ struct Cell {
 
 struct Simulation {
     config: Config,
-    spatial_idx: ahash::AHashMap<IVec2, usize>,
-    spatial_idx_rev: Vec<IVec2>,
-    precompute_mul: Vec<usize>,
-    passive_mul: Vec<usize>,
-    active_mul: Vec<usize>,
-    particles_mul: Vec<Vec<Particle>>,
-    grid_mul: Vec<Vec<Cell>>,
-    neighbors_mul: Vec<Vec<usize>>,
+    particles_mul: ahash::AHashMap<IVec2, Vec<Particle>>,
+    grid_mul: Vec<Cell>,
+    grid_size: IVec2,
+    swap_mul: Vec<Vec<Particle>>,
+    swap_size: IVec2,
+    p_rect: (IVec2, IVec2),
+    a_rect: (IVec2, IVec2),
     debug_elapseds: Vec<(&'static str, std::time::Duration)>,
 }
 
@@ -63,96 +62,48 @@ impl Simulation {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            spatial_idx: ahash::AHashMap::new(),
-            spatial_idx_rev: Vec::new(),
-            precompute_mul: Vec::new(),
-            passive_mul: Vec::new(),
-            active_mul: Vec::new(),
-            particles_mul: Vec::new(),
+            particles_mul: ahash::AHashMap::new(),
             grid_mul: Vec::new(),
-            neighbors_mul: Vec::new(),
+            grid_size: IVec2::ZERO,
+            swap_mul: Vec::new(),
+            swap_size: IVec2::ZERO,
+            p_rect: (IVec2::ZERO, IVec2::ZERO),
+            a_rect: (IVec2::ZERO, IVec2::ZERO),
             debug_elapseds: Vec::new(),
         }
     }
 
-    pub fn set_update_rect(&mut self, min: Vec2, max: Vec2) {
-        // pre-compute
-        for id in self.precompute_mul.drain(..) {
-            free_space(
-                &self.spatial_idx,
-                &self.spatial_idx_rev,
-                &mut self.particles_mul,
-                &mut self.grid_mul,
-                &mut self.neighbors_mul,
-                id,
-            );
-        }
-        let min_key = key_from_pos(min, &self.config) - IVec2::ONE;
-        let max_key = key_from_pos(max, &self.config) + IVec2::ONE;
-        for y in min_key.y..=max_key.y {
-            for x in min_key.x..=max_key.x {
-                init_space(
-                    &mut self.spatial_idx,
-                    &mut self.spatial_idx_rev,
-                    &mut self.particles_mul,
-                    &mut self.grid_mul,
-                    &mut self.neighbors_mul,
-                    &IVec2::new(x, y),
-                );
-
-                let id = self.spatial_idx.get(&IVec2::new(x, y)).unwrap();
-                self.precompute_mul.push(*id);
-            }
-        }
-        for id in self.precompute_mul.iter() {
-            bake_space(
-                &self.spatial_idx,
-                &self.spatial_idx_rev,
-                &mut self.particles_mul,
-                &mut self.grid_mul,
-                &mut self.neighbors_mul,
-                &self.config,
-                *id,
-            );
-        }
-
-        // passive
-        self.passive_mul.clear();
-        let min_key = key_from_pos(min, &self.config) - IVec2::ONE;
-        let max_key = key_from_pos(max, &self.config) + IVec2::ONE;
-        for y in min_key.y..=max_key.y {
-            for x in min_key.x..=max_key.x {
-                let id = self.spatial_idx.get(&IVec2::new(x, y)).unwrap();
-                self.passive_mul.push(*id);
-            }
-        }
-
-        // active
-        self.active_mul.clear();
+    pub fn set_rect(&mut self, min: Vec2, max: Vec2) {
         let min_key = key_from_pos(min, &self.config);
-        let max_key = key_from_pos(max, &self.config);
-        for y in min_key.y..=max_key.y {
-            for x in min_key.x..=max_key.x {
-                let id = self.spatial_idx.get(&IVec2::new(x, y)).unwrap();
-                self.active_mul.push(*id);
+        let max_key = key_from_pos(max, &self.config) + IVec2::ONE;
+        self.a_rect = (min_key, max_key);
+
+        let min_key = min_key - IVec2::ONE;
+        let max_key = max_key + IVec2::ONE;
+        self.p_rect = (min_key, max_key);
+
+        // for particles
+        for ky in self.p_rect.0.y..self.p_rect.1.y {
+            for kx in self.p_rect.0.x..self.p_rect.1.x {
+                let k = IVec2::new(kx, ky);
+                let _ = self.particles_mul.entry(k).or_default();
             }
         }
+
+        // for grid
+        self.grid_size = (self.p_rect.1 - self.p_rect.0) * self.config.grid_res;
+        let size = self.grid_size.x * self.grid_size.y;
+        self.grid_mul = vec![Default::default(); size as usize];
+
+        // for move
+        self.swap_size = self.p_rect.1 - self.p_rect.0;
+        let size = self.swap_size.x * self.swap_size.y;
+        self.swap_mul = vec![Default::default(); size as usize];
     }
 
     pub fn add_particle(&mut self, p: Particle) {
-        let key = key_from_pos(p.pos, &self.config);
-
-        init_space(
-            &mut self.spatial_idx,
-            &mut self.spatial_idx_rev,
-            &mut self.particles_mul,
-            &mut self.grid_mul,
-            &mut self.neighbors_mul,
-            &key,
-        );
-
-        let id = self.spatial_idx.get(&key).unwrap();
-        let particles = self.particles_mul.get_mut(*id).unwrap();
+        let k = key_from_pos(p.pos, &self.config);
+        let particles = self.particles_mul.entry(k).or_default();
         particles.push(p);
     }
 
@@ -183,45 +134,41 @@ impl Simulation {
     }
 
     fn clear_grid(&mut self) {
-        for id in self.passive_mul.iter() {
-            let grid = self.grid_mul.get_mut(*id).unwrap();
-
-            for cell in grid.iter_mut() {
-                cell.vel = Vec2::ZERO;
-                cell.mass = 0.0;
-            }
+        for cell in self.grid_mul.iter_mut() {
+            cell.vel = Vec2::ZERO;
+            cell.mass = 0.0;
         }
     }
 
     fn p2g_1(&mut self) {
-        for id in self.passive_mul.iter() {
-            let particles = self.particles_mul.get(*id).unwrap();
+        for ky in self.p_rect.0.y..self.p_rect.1.y {
+            for kx in self.p_rect.0.x..self.p_rect.1.x {
+                let k = IVec2::new(kx, ky);
+                let particles = self.particles_mul.get(&k).unwrap();
 
-            for p in particles.iter() {
-                let cell_pos = p.pos.floor().as_ivec2();
-                let cell_diff = p.pos - (cell_pos.as_vec2() + Vec2::splat(0.5));
-                let weights = quadratic_weights(cell_diff);
+                for p in particles.iter() {
+                    let cell_pos = p.pos.floor().as_ivec2();
+                    let cell_diff = p.pos - (cell_pos.as_vec2() + Vec2::splat(0.5));
+                    let weights = quadratic_weights(cell_diff);
 
-                for ny in 0..3 {
-                    for nx in 0..3 {
-                        let cell_pos_n = cell_pos + IVec2::new(nx - 1, ny - 1);
-                        let cell_diff_n = p.pos - (cell_pos_n.as_vec2() + Vec2::splat(0.5));
-                        let weight = weights[nx as usize].x * weights[ny as usize].y;
+                    for ny in 0..3 {
+                        for nx in 0..3 {
+                            let cell_pos_n = cell_pos + IVec2::new(nx - 1, ny - 1);
+                            let cell_diff_n = p.pos - (cell_pos_n.as_vec2() + Vec2::splat(0.5));
+                            let weight = weights[nx as usize].x * weights[ny as usize].y;
 
-                        let q = p.affine_momentum * -cell_diff_n;
-                        let mass_contrib = weight * p.mass;
+                            let q = p.affine_momentum * -cell_diff_n;
+                            let mass_contrib = weight * p.mass;
 
-                        if let Some(cell_n) = cell_mut_from_pos(
-                            &self.spatial_idx,
-                            &self.spatial_idx_rev,
-                            &mut self.grid_mul,
-                            &self.neighbors_mul,
-                            &self.config,
-                            *id,
-                            &cell_pos_n,
-                        ) {
-                            cell_n.mass += mass_contrib;
-                            cell_n.vel += mass_contrib * (p.vel + q);
+                            let c1 = cell_pos_n.cmplt(self.p_rect.0 * self.config.grid_res).any();
+                            let c2 = cell_pos_n.cmpge(self.p_rect.1 * self.config.grid_res).any();
+                            if !(c1 || c2) {
+                                let index_xy = cell_pos_n - self.p_rect.0 * self.config.grid_res;
+                                let index = index_xy.x + index_xy.y * self.grid_size.x;
+                                let cell_n = self.grid_mul.get_mut(index as usize).unwrap();
+                                cell_n.mass += mass_contrib;
+                                cell_n.vel += mass_contrib * (p.vel + q);
+                            }
                         }
                     }
                 }
@@ -230,70 +177,65 @@ impl Simulation {
     }
 
     fn p2g_2(&mut self) {
-        let rest_density = self.config.rest_density;
-        let eos_stiffness = self.config.eos_stiffness;
-        let eos_power = self.config.eos_power;
-        let dynamic_viscosity = self.config.dynamic_viscosity;
-        let dt = self.config.dt;
+        for ky in self.p_rect.0.y..self.p_rect.1.y {
+            for kx in self.p_rect.0.x..self.p_rect.1.x {
+                let k = IVec2::new(kx, ky);
+                let particles = self.particles_mul.get(&k).unwrap();
 
-        for id in self.passive_mul.iter() {
-            let particles = self.particles_mul.get(*id).unwrap();
+                for p in particles.iter() {
+                    let cell_pos = p.pos.floor().as_ivec2();
+                    let cell_diff = p.pos - (cell_pos.as_vec2() + Vec2::splat(0.5));
+                    let weights = quadratic_weights(cell_diff);
 
-            for p in particles.iter() {
-                let cell_pos = p.pos.floor().as_ivec2();
-                let cell_diff = p.pos - (cell_pos.as_vec2() + Vec2::splat(0.5));
-                let weights = quadratic_weights(cell_diff);
+                    let rest_density = self.config.rest_density;
+                    let eos_stiffness = self.config.eos_stiffness;
+                    let eos_power = self.config.eos_power;
 
-                let mut density = 0.0;
-                for ny in 0..3 {
-                    for nx in 0..3 {
-                        let cell_pos_n = cell_pos + IVec2::new(nx - 1, ny - 1);
-                        let weight = weights[nx as usize].x * weights[ny as usize].y;
+                    let mut density = 0.0;
+                    for ny in 0..3 {
+                        for nx in 0..3 {
+                            let cell_pos_n = cell_pos + IVec2::new(nx - 1, ny - 1);
+                            let weight = weights[nx as usize].x * weights[ny as usize].y;
 
-                        if let Some(cell_n) = cell_mut_from_pos(
-                            &self.spatial_idx,
-                            &self.spatial_idx_rev,
-                            &mut self.grid_mul,
-                            &self.neighbors_mul,
-                            &self.config,
-                            *id,
-                            &cell_pos_n,
-                        ) {
-                            density += cell_n.mass * weight;
+                            let c1 = cell_pos_n.cmplt(self.p_rect.0 * self.config.grid_res).any();
+                            let c2 = cell_pos_n.cmpge(self.p_rect.1 * self.config.grid_res).any();
+                            if !(c1 || c2) {
+                                let index_xy = cell_pos_n - self.p_rect.0 * self.config.grid_res;
+                                let index = index_xy.x + index_xy.y * self.grid_size.x;
+                                let cell_n = self.grid_mul.get(index as usize).unwrap();
+                                density += cell_n.mass * weight;
+                            }
                         }
                     }
-                }
-                let volume = p.mass / density;
-                let pressure = f32::max(
-                    -0.1,
-                    eos_stiffness * ((density / rest_density).powf(eos_power) - 1.0),
-                );
+                    let volume = p.mass / density;
+                    let pressure = f32::max(
+                        -0.1,
+                        eos_stiffness * ((density / rest_density).powf(eos_power) - 1.0),
+                    );
 
-                let mut strain = p.affine_momentum;
-                let trace = strain.y_axis.x + strain.x_axis.y;
-                strain.y_axis.x = trace;
-                strain.x_axis.y = trace;
+                    let mut strain = p.affine_momentum;
+                    let trace = strain.y_axis.x + strain.x_axis.y;
+                    strain.y_axis.x = trace;
+                    strain.x_axis.y = trace;
 
-                let viscosity_term = dynamic_viscosity * strain;
-                let stress = -pressure * Mat2::IDENTITY + viscosity_term;
-                let eg_16_term_0 = -4.0 * volume * stress * dt;
+                    let viscosity_term = self.config.dynamic_viscosity * strain;
+                    let stress = -pressure * Mat2::IDENTITY + viscosity_term;
+                    let eg_16_term_0 = -4.0 * volume * stress * self.config.dt;
 
-                for ny in 0..3 {
-                    for nx in 0..3 {
-                        let cell_pos_n = cell_pos + IVec2::new(nx - 1, ny - 1);
-                        let cell_diff_n = p.pos - (cell_pos_n.as_vec2() + Vec2::splat(0.5));
-                        let weight = weights[nx as usize].x * weights[ny as usize].y;
+                    for ny in 0..3 {
+                        for nx in 0..3 {
+                            let cell_pos_n = cell_pos + IVec2::new(nx - 1, ny - 1);
+                            let cell_diff_n = p.pos - (cell_pos_n.as_vec2() + Vec2::splat(0.5));
+                            let weight = weights[nx as usize].x * weights[ny as usize].y;
 
-                        if let Some(cell_n) = cell_mut_from_pos(
-                            &self.spatial_idx,
-                            &self.spatial_idx_rev,
-                            &mut self.grid_mul,
-                            &self.neighbors_mul,
-                            &self.config,
-                            *id,
-                            &cell_pos_n,
-                        ) {
-                            cell_n.vel += weight * eg_16_term_0 * -cell_diff_n;
+                            let c1 = cell_pos_n.cmplt(self.p_rect.0 * self.config.grid_res).any();
+                            let c2 = cell_pos_n.cmpge(self.p_rect.1 * self.config.grid_res).any();
+                            if !(c1 || c2) {
+                                let index_xy = cell_pos_n - self.p_rect.0 * self.config.grid_res;
+                                let index = index_xy.x + index_xy.y * self.grid_size.x;
+                                let cell_n = self.grid_mul.get_mut(index as usize).unwrap();
+                                cell_n.vel += weight * eg_16_term_0 * -cell_diff_n;
+                            }
                         }
                     }
                 }
@@ -302,114 +244,129 @@ impl Simulation {
     }
 
     fn update_grid(&mut self) {
-        let dt = self.config.dt;
-        let gravity = self.config.gravity;
-
-        for id in self.passive_mul.iter() {
-            let grid = self.grid_mul.get_mut(*id).unwrap();
-
-            for cell in grid.iter_mut() {
-                if cell.mass > 0.0 {
-                    cell.vel /= cell.mass;
-                    cell.vel += dt * gravity;
-                }
+        for cell in self.grid_mul.iter_mut() {
+            if cell.mass > 0.0 {
+                cell.vel /= cell.mass;
+                cell.vel += self.config.dt * self.config.gravity;
             }
         }
     }
 
     fn g2p(&mut self, mouse_pos: &Option<Vec2>) {
-        let dt = self.config.dt;
-        let mouse_radius = self.config.mouse_radius;
-        let boundary_clip = self.config.boundary_clip;
-        let boundary_damp_dist = self.config.boundary_damp_dist;
+        for ky in self.a_rect.0.y..self.a_rect.1.y {
+            for kx in self.a_rect.0.x..self.a_rect.1.x {
+                let k = IVec2::new(kx, ky);
+                let particles = self.particles_mul.get_mut(&k).unwrap();
 
-        let mut move_buf = vec![];
-        for id in self.active_mul.iter() {
-            let particles = self.particles_mul.get_mut(*id).unwrap();
+                for p in particles.iter_mut() {
+                    p.vel = Vec2::ZERO;
 
-            for mut p in particles.drain(..) {
-                p.vel = Vec2::ZERO;
+                    let cell_pos = p.pos.floor().as_ivec2();
+                    let cell_diff = p.pos - (cell_pos.as_vec2() + Vec2::splat(0.5));
+                    let weights = quadratic_weights(cell_diff);
 
-                let cell_pos = p.pos.floor().as_ivec2();
-                let cell_diff = p.pos - (cell_pos.as_vec2() + Vec2::splat(0.5));
-                let weights = quadratic_weights(cell_diff);
+                    let mut b_mat = Mat2::ZERO;
+                    for ny in 0..3 {
+                        for nx in 0..3 {
+                            let cell_pos_n = cell_pos + IVec2::new(nx - 1, ny - 1);
+                            let cell_diff_n = p.pos - (cell_pos_n.as_vec2() + Vec2::splat(0.5));
+                            let weight = weights[nx as usize].x * weights[ny as usize].y;
 
-                let mut b_mat = Mat2::ZERO;
-                for ny in 0..3 {
-                    for nx in 0..3 {
-                        let cell_pos_n = cell_pos + IVec2::new(nx - 1, ny - 1);
-                        let cell_diff_n = p.pos - (cell_pos_n.as_vec2() + Vec2::splat(0.5));
-                        let weight = weights[nx as usize].x * weights[ny as usize].y;
+                            let c1 = cell_pos_n.cmplt(self.p_rect.0 * self.config.grid_res).any();
+                            let c2 = cell_pos_n.cmpge(self.p_rect.1 * self.config.grid_res).any();
+                            if !(c1 || c2) {
+                                let index_xy = cell_pos_n - self.p_rect.0 * self.config.grid_res;
+                                let index = index_xy.x + index_xy.y * self.grid_size.x;
+                                let cell_n = self.grid_mul.get(index as usize).unwrap();
+                                let weighted_velocity = cell_n.vel * weight;
 
-                        if let Some(cell_n) = cell_mut_from_pos(
-                            &self.spatial_idx,
-                            &self.spatial_idx_rev,
-                            &mut self.grid_mul,
-                            &self.neighbors_mul,
-                            &self.config,
-                            *id,
-                            &cell_pos_n,
-                        ) {
-                            let weighted_velocity = cell_n.vel * weight;
-
-                            let term = Mat2::from_cols(
-                                weighted_velocity * -cell_diff_n.x,
-                                weighted_velocity * -cell_diff_n.y,
-                            );
-                            b_mat += term;
-                            p.vel += weighted_velocity;
+                                let term = Mat2::from_cols(
+                                    weighted_velocity * -cell_diff_n.x,
+                                    weighted_velocity * -cell_diff_n.y,
+                                );
+                                b_mat += term;
+                                p.vel += weighted_velocity;
+                            }
                         }
                     }
-                }
 
-                p.affine_momentum = 4.0 * b_mat;
-                p.pos += p.vel * dt;
+                    p.affine_momentum = 4.0 * b_mat;
+                    p.pos += p.vel * self.config.dt;
 
-                // mouse interaction
+                    // mouse interaction
 
-                if let Some(mouse) = mouse_pos {
-                    let dist = p.pos - mouse;
-                    if dist.length_squared() < mouse_radius.powi(2) {
-                        p.vel += dist.normalize_or_zero();
+                    if let Some(mouse) = mouse_pos {
+                        let dist = p.pos - mouse;
+                        if dist.length_squared() < self.config.mouse_radius.powi(2) {
+                            p.vel += dist.normalize_or_zero();
+                        }
+                    }
+
+                    // boundary conditions
+
+                    p.pos = Vec2::clamp(
+                        p.pos,
+                        self.config.boundary_clip.xy(),
+                        self.config.boundary_clip.zw(),
+                    );
+
+                    let next_pos = p.pos + p.vel;
+                    let wall_min = self.config.boundary_clip.xy()
+                        + Vec2::splat(self.config.boundary_damp_dist);
+                    let wall_max = self.config.boundary_clip.zw()
+                        - Vec2::splat(self.config.boundary_damp_dist);
+
+                    if next_pos.x < wall_min.x {
+                        p.vel.x += wall_min.x - next_pos.x;
+                    }
+                    if next_pos.x > wall_max.x {
+                        p.vel.x += wall_max.x - next_pos.x;
+                    }
+                    if next_pos.y < wall_min.y {
+                        p.vel.y += wall_min.y - next_pos.y;
+                    }
+                    if next_pos.y > wall_max.y {
+                        p.vel.y += wall_max.y - next_pos.y;
                     }
                 }
 
-                // boundary conditions
+                // swap
 
-                p.pos = Vec2::clamp(p.pos, boundary_clip.xy(), boundary_clip.zw());
+                let iter = particles.extract_if(.., |p| key_from_pos(p.pos, &self.config) != k);
+                for p in iter {
+                    let k = key_from_pos(p.pos, &self.config);
 
-                let next_pos = p.pos + p.vel;
-                let wall_min = boundary_clip.xy() + Vec2::splat(boundary_damp_dist);
-                let wall_max = boundary_clip.zw() - Vec2::splat(boundary_damp_dist);
+                    let c1 = k.cmplt(self.p_rect.0).any();
+                    let c2 = k.cmpge(self.p_rect.1).any();
+                    if !(c1 || c2) {
+                        let index_xy = k - self.p_rect.0;
+                        let index = index_xy.x + index_xy.y * self.swap_size.x;
+                        let r#move = self.swap_mul.get_mut(index as usize).unwrap();
+                        r#move.push(p);
+                    }
+                }
+                for ky in self.p_rect.0.y..self.p_rect.1.y {
+                    for kx in self.p_rect.0.x..self.p_rect.1.x {
+                        let k = IVec2::new(kx, ky);
+                        let particles = self.particles_mul.get_mut(&k).unwrap();
 
-                if next_pos.x < wall_min.x {
-                    p.vel.x += wall_min.x - next_pos.x;
-                }
-                if next_pos.x > wall_max.x {
-                    p.vel.x += wall_max.x - next_pos.x;
-                }
-                if next_pos.y < wall_min.y {
-                    p.vel.y += wall_min.y - next_pos.y;
-                }
-                if next_pos.y > wall_max.y {
-                    p.vel.y += wall_max.y - next_pos.y;
-                }
+                        let index_xy = k - self.p_rect.0;
+                        let index = index_xy.x + index_xy.y * self.swap_size.x;
+                        let r#move = self.swap_mul.get_mut(index as usize).unwrap();
 
-                let new_id = 0; // TODO
-                move_buf.push((new_id, p));
+                        particles.append(r#move);
+                    }
+                }
             }
-        }
-
-        for (id, p) in move_buf.into_iter() {
-            let particles = self.particles_mul.get_mut(id).unwrap();
-            particles.push(p);
         }
     }
 
     pub fn iter_particle(&self) -> impl Iterator<Item = &Particle> + '_ {
-        self.active_mul
-            .iter()
-            .filter_map(|id| self.particles_mul.get(*id))
+        let iter = (self.a_rect.0.y..self.a_rect.1.y)
+            .map(|ky| (self.a_rect.0.x..self.a_rect.1.x).map(move |kx| IVec2::new(kx, ky)))
+            .flatten();
+
+        iter.filter_map(|key| self.particles_mul.get(&key))
             .flatten()
     }
 }
@@ -425,97 +382,6 @@ fn quadratic_weights(cell_diff: Vec2) -> [Vec2; 3] {
 fn key_from_pos(pos: Vec2, config: &Config) -> IVec2 {
     pos.div_euclid(Vec2::splat(config.grid_res as f32))
         .as_ivec2()
-}
-
-fn init_space(
-    spatial_idx: &mut ahash::AHashMap<IVec2, usize>,
-    spatial_idx_rev: &mut Vec<IVec2>,
-    particles_mul: &mut Vec<Vec<Particle>>,
-    grid_mul: &mut Vec<Vec<Cell>>,
-    neighbors_mul: &mut Vec<Vec<usize>>,
-    key: &IVec2,
-) {
-    if !spatial_idx.contains_key(&key) {
-        let id = spatial_idx_rev.len();
-
-        spatial_idx_rev.push(*key);
-        particles_mul.push(Default::default());
-        grid_mul.push(Default::default());
-        neighbors_mul.push(Default::default());
-
-        spatial_idx.insert(*key, id);
-    }
-}
-
-fn bake_space(
-    spatial_idx: &ahash::AHashMap<IVec2, usize>,
-    spatial_idx_rev: &Vec<IVec2>,
-    _particles_mul: &mut Vec<Vec<Particle>>,
-    grid_mul: &mut Vec<Vec<Cell>>,
-    neighbors_mul: &mut Vec<Vec<usize>>,
-    config: &Config,
-    id: usize,
-) {
-    // for grid
-    let grid = grid_mul.get_mut(id).unwrap();
-    *grid = vec![Default::default(); (config.grid_res * config.grid_res) as usize];
-
-    // for neighbors
-    let key = spatial_idx_rev.get(id).unwrap();
-    let neighbors = neighbors_mul.get_mut(id).unwrap();
-    *neighbors = vec![Default::default(); 9];
-    for ny in 0..3 {
-        for nx in 0..3 {
-            let key = key + IVec2::new(nx as i32 - 1, ny as i32 - 1);
-            let neighbor_id = 3 * ny + nx;
-            neighbors[neighbor_id] = *spatial_idx.get(&key).unwrap_or(&usize::MAX);
-        }
-    }
-}
-
-fn free_space(
-    _spatial_idx: &ahash::AHashMap<IVec2, usize>,
-    _spatial_idx_rev: &Vec<IVec2>,
-    _particles_mul: &mut Vec<Vec<Particle>>,
-    grid_mul: &mut Vec<Vec<Cell>>,
-    neighbors_mul: &mut Vec<Vec<usize>>,
-    id: usize,
-) {
-    // for grid
-    let grid = grid_mul.get_mut(id).unwrap();
-    *grid = vec![];
-
-    // for neighbors
-    let neighbors = neighbors_mul.get_mut(id).unwrap();
-    *neighbors = vec![];
-}
-
-fn cell_mut_from_pos<'a>(
-    _spatial_idx: &'a ahash::AHashMap<IVec2, usize>,
-    spatial_idx_rev: &'a Vec<IVec2>,
-    grid_mul: &'a mut Vec<Vec<Cell>>,
-    neighbors_mul: &'a Vec<Vec<usize>>,
-    config: &Config,
-    id: usize,
-    pos: &'a IVec2,
-) -> Option<&'a mut Cell> {
-    let neighbors = neighbors_mul.get(id).unwrap();
-
-    let key = spatial_idx_rev.get(id).unwrap();
-    let new_key = pos.div_euclid(IVec2::splat(config.grid_res));
-    let nxy = new_key - key;
-    if nxy.cmplt(IVec2::NEG_ONE).any() || nxy.cmpgt(IVec2::ONE).any() {
-        return None;
-    }
-
-    let neighbor_id = 3 * (nxy.y + 1) + nxy.x + 1;
-    let id = neighbors.get(neighbor_id as usize)?;
-
-    let grid = grid_mul.get_mut(*id).unwrap();
-    let ixy = pos - key * config.grid_res;
-    let index = config.grid_res * ixy.y + ixy.x;
-    let cell = grid.get_mut(index as usize).unwrap();
-    Some(cell)
 }
 
 #[derive(Clone, Copy)]
@@ -644,7 +510,7 @@ fn main() -> std::io::Result<()> {
             mass: 1.0,
         });
     }
-    sim.set_update_rect(Vec2::new(0.0, 0.0), Vec2::new(64.0, 64.0));
+    sim.set_rect(Vec2::new(0.0, 0.0), Vec2::new(64.0, 64.0));
 
     let viewport_size = Vec2::new(64.0, 64.0);
     let console_size = IVec2::new(80, 40);
