@@ -54,6 +54,7 @@ struct Simulation {
     config: Config,
     particles: Vec<Particle>,
     grid: Vec<Cell>,
+    debug_elapseds: Vec<(&'static str, std::time::Duration)>,
 }
 
 impl Simulation {
@@ -67,6 +68,7 @@ impl Simulation {
             config,
             particles,
             grid,
+            debug_elapseds: Vec::new(),
         }
     }
 
@@ -87,11 +89,27 @@ impl Simulation {
 
     fn step(&mut self, mouse_pos: &Option<Vec2>) {
         for _ in 0..self.config.iterations {
+            self.debug_elapseds.clear();
+
+            let instance = std::time::Instant::now();
             self.clear_grid();
+            self.debug_elapseds.push(("clear", instance.elapsed()));
+
+            let instance = std::time::Instant::now();
             self.p2g_1();
+            self.debug_elapseds.push(("p2g 1", instance.elapsed()));
+
+            let instance = std::time::Instant::now();
             self.p2g_2();
+            self.debug_elapseds.push(("p2g 2", instance.elapsed()));
+
+            let instance = std::time::Instant::now();
             self.update_grid();
+            self.debug_elapseds.push(("update", instance.elapsed()));
+
+            let instance = std::time::Instant::now();
             self.g2p(mouse_pos);
+            self.debug_elapseds.push(("g2p", instance.elapsed()));
         }
     }
 
@@ -374,6 +392,15 @@ fn draw(out: &mut impl std::io::Write, sim: &Simulation) -> std::io::Result<()> 
             };
             out.write_all(&[ch])?;
         }
+    }
+
+    for (i, (label, elapsed)) in sim.debug_elapseds.iter().enumerate() {
+        let y = (console_size.y + i as i32) as u16;
+        out.execute(crossterm::cursor::MoveTo(0, y))?;
+        write!(out, "{}: {:?}", label, elapsed)?;
+        out.execute(crossterm::terminal::Clear(
+            crossterm::terminal::ClearType::FromCursorDown,
+        ))?;
     }
 
     Ok(())
