@@ -1,7 +1,7 @@
 [package]
 name = "fluid-rs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "2d_single"
@@ -10,6 +10,10 @@ path = "src/2d_single.rs"
 [[bin]]
 name = "2d_multi"
 path = "src/2d_multi.rs"
+
+[[bin]]
+name = "3d_multi"
+path = "src/3d_multi.rs"
 
 [dependencies]
 ahash = "0.8"
