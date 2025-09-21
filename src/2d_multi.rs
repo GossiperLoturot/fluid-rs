@@ -322,15 +322,16 @@ impl Simulation {
                     r#move.push(p);
                 }
             }
-            for k in grid_search(&self.p_rect.0, &self.p_rect.1) {
-                let particles = self.particles_mul.get_mut(&k).unwrap();
+        }
 
-                let index_xy = k - self.p_rect.0;
-                let index = index_xy.x + index_xy.y * self.swap_size.x;
-                let r#move = self.swap_mul.get_mut(index as usize).unwrap();
+        for k in grid_search(&self.p_rect.0, &self.p_rect.1) {
+            let particles = self.particles_mul.get_mut(&k).unwrap();
 
-                particles.append(r#move);
-            }
+            let index_xy = k - self.p_rect.0;
+            let index = index_xy.x + index_xy.y * self.swap_size.x;
+            let r#move = self.swap_mul.get_mut(index as usize).unwrap();
+
+            particles.append(r#move);
         }
     }
 

@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "2d_single"
-path = "src/2d_single.rs"
-
-[[bin]]
 name = "2d_multi"
 path = "src/2d_multi.rs"
 
@@ -21,3 +17,4 @@ crossbeam-channel = "0.5"
 crossterm = "0.29"
 glam = "0.30"
 rand = "0.9"
+rayon = "1"
