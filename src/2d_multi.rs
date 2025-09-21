@@ -44,6 +44,7 @@ struct Particle {
 struct Cell {
     vel: Vec2,
     mass: f32,
+    is_computed: bool,
 }
 
 struct Simulation {
@@ -51,6 +52,7 @@ struct Simulation {
     particles_mul: ahash::AHashMap<IVec2, Vec<Particle>>,
     grid_mul: Vec<Cell>,
     grid_size: IVec2,
+    sparse_grid: Vec<i32>,
     swap_mul: Vec<Vec<Particle>>,
     swap_size: IVec2,
     p_rect: (IVec2, IVec2),
@@ -65,6 +67,7 @@ impl Simulation {
             particles_mul: ahash::AHashMap::new(),
             grid_mul: Vec::new(),
             grid_size: IVec2::ZERO,
+            sparse_grid: Vec::new(),
             swap_mul: Vec::new(),
             swap_size: IVec2::ZERO,
             p_rect: (IVec2::ZERO, IVec2::ZERO),
@@ -131,10 +134,15 @@ impl Simulation {
     }
 
     fn clear_grid(&mut self) {
-        for cell in self.grid_mul.iter_mut() {
+        for index in self.sparse_grid.iter() {
+            let cell = self.grid_mul.get_mut(*index as usize).unwrap();
+
             cell.vel = Vec2::ZERO;
             cell.mass = 0.0;
+            cell.is_computed = false;
         }
+
+        self.sparse_grid.clear();
     }
 
     fn p2g_1(&mut self) {
@@ -160,8 +168,11 @@ impl Simulation {
                         let index_xy = cell_pos_n - self.p_rect.0 * self.config.grid_res;
                         let index = index_xy.x + index_xy.y * self.grid_size.x;
                         let cell_n = self.grid_mul.get_mut(index as usize).unwrap();
+
                         cell_n.mass += mass_contrib;
                         cell_n.vel += mass_contrib * (p.vel + q);
+
+                        self.sparse_grid.push(index);
                     }
                 }
             }
@@ -192,6 +203,7 @@ impl Simulation {
                         let index_xy = cell_pos_n - self.p_rect.0 * self.config.grid_res;
                         let index = index_xy.x + index_xy.y * self.grid_size.x;
                         let cell_n = self.grid_mul.get(index as usize).unwrap();
+
                         density += cell_n.mass * w;
                     }
                 }
@@ -217,6 +229,7 @@ impl Simulation {
                         let index_xy = cell_pos_n - self.p_rect.0 * self.config.grid_res;
                         let index = index_xy.x + index_xy.y * self.grid_size.x;
                         let cell_n = self.grid_mul.get_mut(index as usize).unwrap();
+
                         cell_n.vel += w * eg_16_term_0 * -cell_diff_n;
                     }
                 }
@@ -225,19 +238,24 @@ impl Simulation {
     }
 
     fn update_grid(&mut self) {
-        for cell in self.grid_mul.iter_mut() {
-            if cell.mass > 0.0 {
+        for index in self.sparse_grid.iter() {
+            let cell = self.grid_mul.get_mut(*index as usize).unwrap();
+
+            if !cell.is_computed && cell.mass > 0.0 {
                 cell.vel /= cell.mass;
                 cell.vel += self.config.dt * self.config.gravity;
+                cell.is_computed = true;
             }
         }
     }
 
     fn g2p(&mut self, mouse_pos: &Option<Vec2>) {
+        let mut move_buf = vec![];
         for k in grid_search(&self.a_rect.0, &self.a_rect.1) {
             let particles = self.particles_mul.get_mut(&k).unwrap();
 
-            for p in particles.iter_mut() {
+            move_buf.clear();
+            for (i, p) in particles.iter_mut().enumerate() {
                 p.vel = Vec2::ZERO;
 
                 let cell_pos = p.pos.floor().as_ivec2();
@@ -256,8 +274,8 @@ impl Simulation {
                         let index_xy = cell_pos_n - self.p_rect.0 * self.config.grid_res;
                         let index = index_xy.x + index_xy.y * self.grid_size.x;
                         let cell_n = self.grid_mul.get(index as usize).unwrap();
-                        let weighted_velocity = cell_n.vel * w;
 
+                        let weighted_velocity = cell_n.vel * w;
                         let term = Mat2::from_cols(
                             weighted_velocity * -cell_diff_n.x,
                             weighted_velocity * -cell_diff_n.y,
@@ -305,20 +323,25 @@ impl Simulation {
                 if next_pos.y > wall_max.y {
                     p.vel.y += wall_max.y - next_pos.y;
                 }
+
+                // swap
+
+                let new_k = key_from_pos(p.pos, &self.config);
+                if new_k != k {
+                    move_buf.push((i as i32, new_k));
+                }
             }
 
-            // swap
-
-            let iter = particles.extract_if(.., |p| key_from_pos(p.pos, &self.config) != k);
-            for p in iter {
-                let k = key_from_pos(p.pos, &self.config);
+            for (i, k) in move_buf.drain(..).rev() {
+                let p = particles.swap_remove(i as usize);
 
                 let c1 = k.cmplt(self.p_rect.0).any();
                 let c2 = k.cmpge(self.p_rect.1).any();
                 if !(c1 || c2) {
-                    let index_xy = k - self.p_rect.0;
-                    let index = index_xy.x + index_xy.y * self.swap_size.x;
+                    let index_xyz = k - self.p_rect.0;
+                    let index = index_xyz.x + index_xyz.y * self.swap_size.x;
                     let r#move = self.swap_mul.get_mut(index as usize).unwrap();
+
                     r#move.push(p);
                 }
             }
